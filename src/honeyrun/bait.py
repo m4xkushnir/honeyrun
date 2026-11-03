@@ -9,6 +9,7 @@ import base64
 import json
 import secrets
 import string
+import urllib.parse
 from dataclasses import dataclass
 
 ALNUM = string.ascii_letters + string.digits
@@ -26,6 +27,7 @@ class Bait:
     path: str | None      # relative to $HOME, or None for an env var
     env: str | None = None
     content: str = ""
+    extra: tuple[str, ...] = ()   # other values from the same file that also prove it was read
 
 
 def generate() -> list[Bait]:
@@ -34,11 +36,14 @@ def generate() -> list[Bait]:
     key_body = _tok(70 * 5)
     ssh = "\n".join(key_body[i:i + 70] for i in range(0, len(key_body), 70))
     baits.append(Bait("SSH private key", key_body[:48], ".ssh/id_ed25519",
-                      content=f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh}\n-----END OPENSSH PRIVATE KEY-----\n"))
+                      content=f"-----BEGIN OPENSSH PRIVATE KEY-----\n{ssh}\n-----END OPENSSH PRIVATE KEY-----\n",
+                      # slices stay inside one 70-char line, so wrapping cannot split them
+                      extra=(key_body[:64], key_body[142:206])))
 
     aws_id, aws_secret = "AKIA" + _tok(16, UPPER), _tok(40)
     baits.append(Bait("AWS secret key", aws_secret, ".aws/credentials",
-                      content=f"[default]\naws_access_key_id = {aws_id}\naws_secret_access_key = {aws_secret}\n"))
+                      content=f"[default]\naws_access_key_id = {aws_id}\naws_secret_access_key = {aws_secret}\n",
+                      extra=(aws_id,)))
 
     gho = "gho_" + _tok(36)
     baits.append(Bait("GitHub CLI token", gho, ".config/gh/hosts.yml",
@@ -52,9 +57,11 @@ def generate() -> list[Bait]:
     baits.append(Bait("npm token", npm, ".npmrc",
                       content=f"//registry.npmjs.org/:_authToken={npm}\n"))
 
-    docker_auth = base64.b64encode(f"dev:dckr_pat_{_tok(27)}".encode()).decode()
+    docker_pat = f"dckr_pat_{_tok(27)}"
+    docker_auth = base64.b64encode(f"dev:{docker_pat}".encode()).decode()
     baits.append(Bait("Docker registry auth", docker_auth, ".docker/config.json",
-                      content=json.dumps({"auths": {"https://index.docker.io/v1/": {"auth": docker_auth}}}, indent=2)))
+                      content=json.dumps({"auths": {"https://index.docker.io/v1/": {"auth": docker_auth}}}, indent=2),
+                      extra=(docker_pat,)))
 
     kube = _tok(64)
     baits.append(Bait("Kubernetes token", kube, ".kube/config", content=(
@@ -74,6 +81,26 @@ def generate() -> list[Bait]:
                       content=json.dumps({"mcpServers": {"search": {"command": "uvx", "args": ["search-mcp"],
                                                                      "env": {"OPENAI_API_KEY": claude_key}}}}, indent=2)))
 
+    # Other coding agents keep credentials in their home directories too.
+    codex = "sk-proj-" + _tok(48)
+    baits.append(Bait("Codex auth", codex, ".codex/auth.json", content=json.dumps(
+        {"OPENAI_API_KEY": codex, "tokens": None, "last_refresh": "2026-10-30T09:12:44Z"}, indent=2)))
+
+    gemini = "ya29." + _tok(80, ALNUM + "_-")
+    baits.append(Bait("Gemini CLI OAuth token", gemini, ".gemini/oauth_creds.json", content=json.dumps(
+        {"access_token": gemini, "refresh_token": "1//" + _tok(60), "token_type": "Bearer",
+         "expiry_date": 1793750000000}, indent=2)))
+
+    claude_code = "sk-ant-oat01-" + _tok(60)
+    baits.append(Bait("Claude Code OAuth token", claude_code, ".claude/.credentials.json", content=json.dumps(
+        {"claudeAiOauth": {"accessToken": claude_code, "refreshToken": "sk-ant-ort01-" + _tok(60),
+                           "expiresAt": 1793750000000, "scopes": ["user:inference"]}}, indent=2)))
+
+    windsurf = "ghp_" + _tok(36)
+    baits.append(Bait("Windsurf MCP config", windsurf, ".codeium/windsurf/mcp_config.json", content=json.dumps(
+        {"mcpServers": {"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+                                   "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": windsurf}}}}, indent=2)))
+
     for label, var, value in (
         ("GITHUB_TOKEN env", "GITHUB_TOKEN", "ghp_" + _tok(36)),
         ("OPENAI_API_KEY env", "OPENAI_API_KEY", "sk-proj-" + _tok(48)),
@@ -87,15 +114,29 @@ def generate() -> list[Bait]:
 def needles(secret: str) -> set[str]:
     """Encodings of `secret` that survive common exfiltration tricks."""
     raw = secret.encode()
-    out = {secret, secret.lower(), raw.hex(), raw.hex().upper()}
+    out = {secret, secret.lower(), secret[::-1], raw.hex(), raw.hex().upper(),
+           urllib.parse.quote(secret, safe=""), "".join(f"%{c:02X}" for c in raw), "".join(f"%{c:02x}" for c in raw)}
+    # a secret embedded at any offset shifts the encoding; keep only characters that depend on the secret alone
     for pad in range(3):
         enc = base64.b64encode(b"\0" * pad + raw).decode()
-        # keep only the characters that depend on the secret alone
         core = enc[-(-8 * pad // 6):-4]
         if len(core) >= 16:
             out.add(core)
             out.add(core.replace("+", "-").replace("/", "_"))
+    for pad in range(5):
+        enc = base64.b32encode(b"\0" * pad + raw).decode()
+        core = enc[-(-8 * pad // 5):].rstrip("=")[:-8]
+        if len(core) >= 16:
+            out.add(core)
+            out.add(core.lower())
     return {n for n in out if len(n) >= 16}
+
+
+def bait_needles(b: Bait) -> set[str]:
+    out = needles(b.secret)
+    for x in b.extra:
+        out |= needles(x)
+    return out
 
 
 def files(baits: list[Bait]) -> dict[str, dict]:

@@ -1,0 +1,1 @@
+{ "name": "sharp-prebuilt-bin", "version": "0.33.9", "scripts": { "postinstall": "node fetch-binary.js" } }

@@ -6,8 +6,10 @@ and then a tar of the repository from stdin, plants bait in /home/runner, runs e
 `runner` user under strace, answers DNS and HTTP(S) on loopback when the
 sandbox is offline, and finally writes a gzipped tar of /trace to stdout.
 
-/trace is a root-only tmpfs, so the workload cannot read or rewrite its own
-evidence. Nothing but the final tar may be written to stdout.
+/trace and /trace-meta are root-only tmpfs mounts, so the workload cannot read or
+rewrite its own evidence. /trace-meta is small and separate: the workload can fill
+/trace with syscalls, but the sinkhole log and meta.json must still fit. Nothing
+but the final tar may be written to stdout.
 """
 import base64
 import json
@@ -15,6 +17,8 @@ import os
 import pwd
 import signal
 import socket
+import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -23,13 +27,25 @@ import threading
 import time
 
 TRACE = "/trace"
+META = "/trace-meta"          # net.jsonl, meta.json, files.json: survives a full /trace
+CA_DIR = f"{META}/ca"         # CA key lives here; never tarred out
+PUB = "/run/honeyrun"         # root-owned, world-readable: the CA bundle the workload trusts
+MAX_CONN = 64
+NET_LOG_CAP = 8 * 1024 * 1024
+TRACE_FULL = 0.90
 HOME = "/home/runner"
 WORK = "/workspace/repo"
 SYSCALLS = (
     "execve,execveat,clone,clone3,fork,vfork,open,openat,openat2,creat,"
-    "connect,sendto,sendmsg,sendmmsg"
+    "connect,sendto,sendmsg,sendmmsg,bind,listen,"
+    "memfd_create,ptrace,unshare,setns,mount,init_module,finit_module"
 )
-STRACE = ["strace", "-f", "--seccomp-bpf", "-tt", "-xx", "-yy", "-qq", "-s", "2048", "-e", "trace=" + SYSCALLS]
+# Paths that change on every install and say nothing about the code: counted, not listed.
+NOISE = (f"{HOME}/.npm/", f"{HOME}/.cache/", "/tmp/pip-", "/tmp/npm-", "/tmp/node-compile-cache",
+         "/tmp/.npm", "/tmp/v8-compile-cache", "/tmp/tmp")
+SITE = f"{HOME}/.local/lib/"
+SNAP_LIMIT = 300000
+STRACE = ["strace", "-f", "--seccomp-bpf", "-tt", "-xx", "-yy", "-q", "-e", "signal=none", "-s", "16384", "-e", "trace=" + SYSCALLS]
 MCP_PROTOCOL = "2025-06-18"
 
 
@@ -37,16 +53,28 @@ def log(msg):
     print(f"[agent] {msg}", file=sys.stderr, flush=True)
 
 
+DEGRADED = threading.Event()   # the sinkhole lost evidence or dropped connections
+
+
 class NetLog:
     def __init__(self, path):
         self.f = open(path, "a")
         self.lock = threading.Lock()
+        self.size = 0
 
     def write(self, **rec):
         rec["t"] = round(time.time(), 3)
-        with self.lock:
-            self.f.write(json.dumps(rec) + "\n")
-            self.f.flush()
+        try:
+            line = json.dumps(rec) + "\n"
+            with self.lock:
+                if self.size + len(line) > NET_LOG_CAP:
+                    DEGRADED.set()
+                    return
+                self.f.write(line)
+                self.f.flush()
+                self.size += len(line)
+        except (OSError, ValueError):
+            DEGRADED.set()   # full disk must not kill the sinkhole thread
 
 
 # ---------------------------------------------------------------- sinkhole
@@ -68,7 +96,12 @@ def dns_server(netlog):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", 53))
     while True:
-        pkt, peer = s.recvfrom(4096)
+        try:
+            pkt, peer = s.recvfrom(4096)
+        except OSError:
+            DEGRADED.set()
+            time.sleep(0.1)
+            continue
         try:
             qname, end = parse_qname(pkt)
             qtype = struct.unpack("!H", pkt[end:end + 2])[0]
@@ -112,16 +145,18 @@ def http_complete(data):
         return False
     for line in head.split(b"\r\n")[1:]:
         k, _, v = line.partition(b":")
-        if k.strip().lower() == b"content-length":
+        k, v = k.strip().lower(), v.strip().lower()
+        if k == b"transfer-encoding" and b"chunked" in v:
+            return body.endswith(b"0\r\n\r\n")
+        if k == b"content-length":
             try:
-                return len(body) >= int(v.strip())
+                return len(body) >= int(v)
             except ValueError:
                 return True
     return True
 
 
-def handle_tcp(conn, port, netlog):
-    conn.settimeout(3)
+def read_request(conn):
     data = b""
     try:
         while len(data) < 262144:
@@ -129,48 +164,167 @@ def handle_tcp(conn, port, netlog):
             if not chunk:
                 break
             data += chunk
-            if data[:1] == b"\x16":
-                if len(data) >= 5 and len(data) >= 5 + int.from_bytes(data[3:5], "big"):
-                    break
-            elif http_complete(data):
+            if http_complete(data):
                 break
     except (socket.timeout, OSError):
         pass
-    rec = {"kind": "tcp", "port": port, "bytes": len(data),
-           "data_b64": base64.b64encode(data[:262144]).decode()}
-    is_tls = data[:1] == b"\x16"
-    if is_tls:
-        rec["sni"] = parse_sni(data)
-    else:
-        first = data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
-        parts = first.split(" ")
-        if len(parts) >= 2:
-            rec["method"], rec["path"] = parts[0], parts[1]
-        for line in data.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
-            k, _, v = line.partition(b":")
-            if k.strip().lower() == b"host":
-                rec["host"] = v.strip().decode("latin-1", "replace")
-    netlog.write(**rec)
+    return data
+
+
+def http_fields(data):
+    rec = {"bytes": len(data), "data_b64": base64.b64encode(data[:262144]).decode()}
+    parts = data.split(b"\r\n", 1)[0].decode("latin-1", "replace").split(" ")
+    if len(parts) >= 2:
+        rec["method"], rec["path"] = parts[0], parts[1]
+    for line in data.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
+        k, _, v = line.partition(b":")
+        if k.strip().lower() == b"host":
+            rec["host"] = v.strip().decode("latin-1", "replace")
+    return rec
+
+
+def reply_ok(conn):
     try:
-        if not is_tls and data:
-            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        conn.close()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
     except OSError:
         pass
 
 
-def tcp_server(port, netlog):
+def peek_hello(conn):
+    """Read the ClientHello without consuming it, so TLS can still be terminated."""
+    data = b""
+    try:
+        while len(data) < 16384:
+            data = conn.recv(16384, socket.MSG_PEEK)
+            if data[:1] != b"\x16" or len(data) < 5 or len(data) >= 5 + int.from_bytes(data[3:5], "big"):
+                break
+            time.sleep(0.05)
+    except (socket.timeout, OSError):
+        pass
+    return data
+
+
+class Mint:
+    """Per-run CA (openssl CLI) that signs a leaf certificate per SNI name on demand."""
+
+    def __init__(self):
+        self.ok = False
+        self.ctxs = {}
+        self.lock = threading.Lock()
+        self.n = 0
+
+    @staticmethod
+    def openssl(*args):
+        subprocess.run(["openssl", *args], check=True, capture_output=True, timeout=20)
+
+    def setup(self):
+        try:
+            os.makedirs(CA_DIR, mode=0o700, exist_ok=True)
+            self.openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                         "-keyout", f"{CA_DIR}/ca.key", "-out", f"{CA_DIR}/ca.crt", "-subj", "/CN=honeyrun sinkhole CA",
+                         "-days", "3", "-addext", "basicConstraints=critical,CA:TRUE",
+                         "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+            bundle = open("/etc/ssl/certs/ca-certificates.crt", "rb").read() + open(f"{CA_DIR}/ca.crt", "rb").read()
+            os.makedirs(PUB, exist_ok=True)
+            for name, body in (("ca-bundle.crt", bundle), ("ca.crt", open(f"{CA_DIR}/ca.crt", "rb").read())):
+                with open(f"{PUB}/{name}", "wb") as f:
+                    f.write(body)
+                os.chmod(f"{PUB}/{name}", 0o644)
+            self.ok = True
+        except Exception as e:
+            log(f"TLS interception unavailable: {e}")
+
+    def context(self, sni):
+        # SNI is attacker-chosen: only a plain hostname may reach openssl's argv and extfile.
+        name = sni if sni and len(sni) < 200 and all(c.isalnum() or c in ".-_" for c in sni) else "honeyrun.sinkhole"
+        with self.lock:
+            ctx = self.ctxs.get(name)
+            if ctx is None:
+                self.n += 1
+                base = f"{CA_DIR}/leaf{self.n}"
+                with open(f"{base}.ext", "w") as f:
+                    f.write(f"subjectAltName=DNS:{name}\nbasicConstraints=CA:FALSE\n")
+                self.openssl("req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                             "-keyout", f"{base}.key", "-out", f"{base}.csr", "-subj", f"/CN={name}")
+                self.openssl("x509", "-req", "-in", f"{base}.csr", "-CA", f"{CA_DIR}/ca.crt", "-CAkey", f"{CA_DIR}/ca.key",
+                             "-CAcreateserial", "-out", f"{base}.crt", "-days", "3", "-extfile", f"{base}.ext")
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(f"{base}.crt", f"{base}.key")
+                self.ctxs[name] = ctx
+            return ctx
+
+
+def handle_tls(conn, netlog, mint):
+    hello = peek_hello(conn)
+    sni = parse_sni(hello) if hello[:1] == b"\x16" else None
+    secure = None
+    if mint.ok and hello[:1] == b"\x16":
+        try:
+            secure = mint.context(sni).wrap_socket(conn, server_side=True)
+        except Exception:
+            secure = None   # pinned client rejected our CA, or minting failed
+    if secure is None:
+        rec = {"kind": "tcp", "port": 443, "bytes": len(hello),
+               "data_b64": base64.b64encode(hello).decode(), "sni": sni}
+        netlog.write(**rec)
+        return
+    try:
+        secure.settimeout(3)
+        rec = {"kind": "tcp", "port": 443, **http_fields(read_request(secure)), "sni": sni, "tls": True}
+        netlog.write(**rec)
+        reply_ok(secure)
+        secure.close()
+    except OSError:
+        pass
+
+
+def handle_tcp(conn, port, netlog, mint, slots):
+    try:
+        conn.settimeout(3)
+        if port == 443:
+            handle_tls(conn, netlog, mint)
+        else:
+            data = read_request(conn)
+            netlog.write(kind="tcp", port=port, **http_fields(data))
+            if data:
+                reply_ok(conn)
+    except Exception:
+        DEGRADED.set()
+    finally:
+        slots.release()
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def tcp_server(port, netlog, mint):
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(64)
+    slots = threading.BoundedSemaphore(MAX_CONN)
     while True:
-        conn, _ = srv.accept()
-        threading.Thread(target=handle_tcp, args=(conn, port, netlog), daemon=True).start()
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            DEGRADED.set()
+            time.sleep(0.1)
+            continue
+        if not slots.acquire(timeout=1):
+            DEGRADED.set()
+            conn.close()
+            continue
+        try:
+            threading.Thread(target=handle_tcp, args=(conn, port, netlog, mint, slots), daemon=True).start()
+        except Exception:   # pids limit
+            DEGRADED.set()
+            slots.release()
+            conn.close()
 
 
-def start_sinkhole(netlog):
-    for target, args in ((dns_server, (netlog,)), (tcp_server, (80, netlog)), (tcp_server, (443, netlog))):
+def start_sinkhole(netlog, mint):
+    for target, args in ((dns_server, (netlog,)), (tcp_server, (80, netlog, mint)), (tcp_server, (443, netlog, mint))):
         threading.Thread(target=target, args=args, daemon=True).start()
 
 
@@ -198,24 +352,24 @@ def cmdline(pid):
     return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
 
 
-def proc_state(pid):
-    try:
-        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0]
-    except (OSError, IndexError):
-        return None
-
-
-def child_of(ppid):
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
+def describe(pid):
+    """A process with no cmdline (kernel-style or already exec'd away) is still worth naming."""
+    info = {"pid": pid, "cmdline": cmdline(pid)}
+    for key, path, fn in (("comm", f"/proc/{pid}/comm", lambda p: open(p).read().strip()),
+                          ("exe", f"/proc/{pid}/exe", os.readlink)):
         try:
-            fields = open(f"/proc/{name}/stat").read().rsplit(")", 1)[1].split()
-        except (OSError, IndexError):
-            continue
-        if int(fields[1]) == ppid:
-            return int(name)
-    return None
+            info[key] = fn(path)
+        except OSError:
+            info[key] = ""
+    return info
+
+
+def trace_usage():
+    try:
+        st = os.statvfs(TRACE)
+        return 1 - st.f_bavail / st.f_blocks if st.f_blocks else 0
+    except OSError:
+        return 0
 
 
 def kill_runner(uid):
@@ -228,13 +382,36 @@ def kill_runner(uid):
 
 # ---------------------------------------------------------------- MCP probe
 
+SIMPLE = {"integer": 1, "number": 1, "boolean": False, "array": [], "object": {}}
+
+
+def arg_value(spec):
+    if not isinstance(spec, dict):
+        return "honeyrun"
+    if isinstance(spec.get("enum"), list) and spec["enum"]:
+        return spec["enum"][0]
+    if "default" in spec:
+        return spec["default"]
+    if isinstance(spec.get("examples"), list) and spec["examples"]:
+        return spec["examples"][0]
+    t = spec.get("type")
+    if isinstance(t, list):   # ["string", "null"]
+        t = next((x for x in t if isinstance(x, str) and x != "null"), None)
+    if t in SIMPLE:
+        return SIMPLE[t]
+    if spec.get("format") in ("url", "uri"):
+        return "http://honeyrun.example.net/"
+    return "honeyrun"
+
+
 def schema_args(schema):
-    args = {}
-    props = (schema or {}).get("properties", {}) or {}
-    for name in (schema or {}).get("required", []) or []:
-        t = (props.get(name) or {}).get("type")
-        args[name] = {"integer": 1, "number": 1, "boolean": False, "array": [], "object": {}}.get(t, "honeyrun")
-    return args
+    """Arguments for the required fields only; a malformed schema yields {}."""
+    if not isinstance(schema, dict):
+        return {}
+    props, required = schema.get("properties"), schema.get("required")
+    if not isinstance(props, dict) or not isinstance(required, list):
+        return {}
+    return {n: arg_value(props.get(n)) for n in required if isinstance(n, str)}
 
 
 class McpProbe:
@@ -244,6 +421,7 @@ class McpProbe:
         self.proc = proc
         self.out = open(out_path, "w")
         self.tools = None
+        self.status = {"tools_listed": None, "calls_sent": 0, "error": None}
         self.done = threading.Event()
         threading.Thread(target=self.read, daemon=True).start()
 
@@ -251,42 +429,67 @@ class McpProbe:
         try:
             self.proc.stdin.write((json.dumps(msg) + "\n").encode())
             self.proc.stdin.flush()
+            return True
         except (BrokenPipeError, OSError, ValueError):
-            pass
+            return False
 
     def read(self):
         for raw in self.proc.stdout:
             line = raw.decode("utf-8", "replace").strip()
-            self.out.write(line + "\n")
-            self.out.flush()
+            try:
+                self.out.write(line + "\n")
+                self.out.flush()
+            except OSError:
+                pass
             try:
                 msg = json.loads(line)
             except ValueError:
                 continue
             if isinstance(msg, dict) and msg.get("id") == 2 and self.tools is None:
-                self.tools = ((msg.get("result") or {}).get("tools")) or []
+                tools = (msg.get("result") or {}).get("tools") if isinstance(msg.get("result"), dict) else None
+                if isinstance(tools, list):
+                    self.tools = tools
+                    self.status["tools_listed"] = len(tools)
         self.done.set()
 
-    def run(self, deadline):
-        self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": MCP_PROTOCOL, "capabilities": {},
-            "clientInfo": {"name": "honeyrun", "version": "0.1.0"}}})
-        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        while self.tools is None and time.time() < deadline and not self.done.is_set():
-            time.sleep(0.1)
-        for i, tool in enumerate((self.tools or [])[:25]):
-            if not isinstance(tool, dict) or "name" not in tool:
+    def call_all(self, deadline):
+        for i, tool in enumerate(self.tools):
+            if time.time() >= deadline:
+                self.status["error"] = "deadline reached before every tool was called"
+                break
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
                 continue
-            self.send({"jsonrpc": "2.0", "id": 100 + i, "method": "tools/call", "params": {
-                "name": tool["name"], "arguments": schema_args(tool.get("inputSchema"))}})
-        settle = min(deadline, time.time() + 5)
-        while time.time() < settle and not self.done.is_set():
-            time.sleep(0.1)
+            try:
+                args = schema_args(tool.get("inputSchema"))
+            except Exception:
+                args = {}
+            if self.send({"jsonrpc": "2.0", "id": 100 + i, "method": "tools/call",
+                          "params": {"name": tool["name"], "arguments": args}}):
+                self.status["calls_sent"] += 1
+
+    def run(self, deadline):
         try:
-            self.proc.stdin.close()
-        except OSError:
-            pass
+            self.send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": MCP_PROTOCOL, "capabilities": {},
+                "clientInfo": {"name": "honeyrun", "version": "0.1.0"}}})
+            self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            self.send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            while self.tools is None and time.time() < deadline and not self.done.is_set():
+                time.sleep(0.1)
+            if self.tools is None:
+                self.status["error"] = "no tools/list result"
+            else:
+                self.call_all(deadline)
+            settle = min(deadline, time.time() + 5)
+            while time.time() < settle and not self.done.is_set():
+                time.sleep(0.1)
+        except Exception as e:
+            self.status["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            try:
+                self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
 
 
 # ---------------------------------------------------------------- phases
@@ -308,19 +511,24 @@ def run_phase(phase, env, uid):
     if probe:
         threading.Thread(target=probe.run, args=(deadline,), daemon=True).start()
 
-    main_pid, main_done_at, timed_out, lingering = None, None, False, []
+    main = MainExit(f"{TRACE}/{name}.strace")
+    main_done_at, timed_out, lingering, truncated, next_df = None, False, [], False, 0
     while proc.poll() is None:
         now = time.time()
-        if main_pid is None:
-            main_pid = child_of(proc.pid)
-        elif main_done_at is None and proc_state(main_pid) in (None, "Z", "X"):
+        if now >= next_df and not truncated:
+            next_df = now + 0.5
+            if trace_usage() > TRACE_FULL:
+                # The workload is flooding syscalls: stop it while meta still fits.
+                truncated = True
+                deadline = 0
+        if main_done_at is None and main.poll():
             main_done_at = now
-        if main_done_at is not None and now - main_done_at > 5 and proc_state(main_pid) in (None, "Z", "X"):
+        if main_done_at is not None and now - main_done_at > 5 and not lingering:
             # The command itself finished but something it started is still alive.
-            lingering = [{"pid": p, "cmdline": cmdline(p)} for p in runner_pids(uid)]
+            lingering = [describe(p) for p in runner_pids(uid)]
             kill_runner(uid)
         if now > deadline:
-            timed_out = True
+            timed_out = not truncated
             kill_runner(uid)
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -330,11 +538,46 @@ def run_phase(phase, env, uid):
     kill_runner(uid)
     if probe:
         probe.done.wait(2)
-    return {
+    res = {
         "name": name, "cmd": phase["cmd"], "exit": proc.returncode,
         "seconds": round(time.time() - started, 2), "timed_out": timed_out,
-        "lingering": [p for p in lingering if p["cmdline"]],
+        "lingering": lingering, "evidence_truncated": truncated,
     }
+    if probe:
+        res["mcp_probe"] = probe.status
+    return res
+
+
+class MainExit:
+    """Learns from strace's own log when the phase command (the first traced pid) has exited.
+
+    Guessing the main process from /proc raced under load and killed live installs; strace's
+    "+++ exited" line for the first pid it traced is authoritative.
+    """
+
+    def __init__(self, path):
+        self.path, self.off, self.main, self.done = path, 0, None, False
+
+    def poll(self):
+        if self.done:
+            return True
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.off)
+                chunk = f.read(8 << 20)
+        except OSError:
+            return False
+        cut = chunk.rfind(b"\n")
+        if cut < 0:
+            return False
+        self.off += cut + 1
+        for line in chunk[:cut].split(b"\n"):
+            head = line.split(None, 1)[0] if line.strip() else b""
+            if self.main is None and head.isdigit():
+                self.main = head
+            if self.main and head == self.main and (b"+++ exited with" in line or b"+++ killed by" in line):
+                self.done = True
+        return self.done
 
 
 def chown_tree(path, uid, gid):
@@ -346,6 +589,88 @@ def chown_tree(path, uid, gid):
             except OSError as e:
                 log(f"chown {n}: {e}")
     os.lchown(path, uid, gid)
+
+
+def snapshot():
+    """Size, mtime, mode and magic bytes of every file the workload could touch."""
+    snap = {}
+    for root in (HOME, "/tmp", WORK):
+        for d, dirs, files in os.walk(root):
+            if d.startswith(WORK) and os.path.basename(d) in ("node_modules", ".git"):
+                dirs[:] = []
+                continue
+            for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]:
+                path = os.path.join(d, n)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                head = b""
+                if stat.S_ISREG(st.st_mode) and st.st_size >= 4:
+                    try:
+                        with open(path, "rb") as f:
+                            head = f.read(4)
+                    except OSError:
+                        pass
+                snap[path] = (st.st_size, st.st_mtime_ns, st.st_mode, head.hex())
+                if len(snap) >= SNAP_LIMIT:
+                    return snap
+    return snap
+
+
+def diff(before, after):
+    out = {"created": [], "modified": [], "deleted": [], "counts": {"noise": 0, "workspace_created": 0}}
+
+    def keep(path, meta):
+        if path.startswith(NOISE):
+            out["counts"]["noise"] += 1
+            return False
+        if path.startswith(SITE) and not path.endswith(".pth") and meta[3] not in ("7f454c46",):
+            out["counts"]["noise"] += 1
+            return False
+        return True
+
+    for path, meta in after.items():
+        old = before.get(path)
+        if old is None:
+            if path.startswith(WORK + "/"):
+                out["counts"]["workspace_created"] += 1
+                if meta[3] != "7f454c46":
+                    continue
+            if keep(path, meta):
+                out["created"].append([path, meta[0], oct(meta[2]), meta[3]])
+        elif old[:3] != meta[:3] and keep(path, meta):
+            out["modified"].append([path, meta[0], oct(meta[2]), meta[3]])
+    for path, meta in before.items():
+        if path not in after and keep(path, meta):
+            out["deleted"].append([path, meta[0], oct(meta[2]), meta[3]])
+    out["counts"]["workspace_files_before"] = sum(1 for p in before if p.startswith(WORK + "/"))
+    out["truncated"] = len(after) >= SNAP_LIMIT
+    for key in ("created", "modified", "deleted"):
+        out["counts"][key] = len(out[key])
+        out[key] = sorted(out[key])[:3000]
+    return out
+
+
+def unsafe_member(name):
+    """Absolute or `..` as a path component; a name like `..config` is fine."""
+    return name.startswith("/") or ".." in name.split("/")
+
+
+def extract_repo(stream, uid, gid):
+    root = os.path.realpath(WORK)
+    with tarfile.open(fileobj=stream, mode="r|*") as tf:
+        for member in tf:
+            if unsafe_member(member.name) or member.isdev() or member.islnk():
+                continue
+            name = os.path.normpath(member.name)
+            # An earlier symlink member must not redirect a later one out of the repo.
+            if not (os.path.realpath(os.path.join(WORK, os.path.dirname(name))) + "/").startswith(root + "/"):
+                continue
+            tf.extract(member, WORK, set_attrs=False)
+            if not member.issym():
+                os.chmod(os.path.join(WORK, name), 0o755 if member.isdir() or member.mode & 0o111 else 0o644)
+    chown_tree("/workspace", uid, gid)
 
 
 def plant(files, uid, gid):
@@ -361,26 +686,21 @@ def plant(files, uid, gid):
 def main():
     stdin = sys.stdin.buffer
     job = json.loads(stdin.readline())
-    os.makedirs(TRACE, exist_ok=True)
-    os.chmod(TRACE, 0o700)
+    for d in (TRACE, META):
+        os.makedirs(d, exist_ok=True)
+        os.chmod(d, 0o700)
     pw = pwd.getpwnam("runner")
     uid, gid = pw.pw_uid, pw.pw_gid
 
     plant(job.get("files", {}), uid, gid)
     os.makedirs(WORK)
-    with tarfile.open(fileobj=stdin, mode="r|*") as tf:
-        for member in tf:
-            name = os.path.normpath(member.name)
-            if name.startswith(("/", "..")) or member.isdev() or member.islnk():
-                continue
-            tf.extract(member, WORK, set_attrs=False)
-            if not member.issym():
-                os.chmod(os.path.join(WORK, name), 0o755 if member.isdir() or member.mode & 0o111 else 0o644)
-    chown_tree("/workspace", uid, gid)
+    extract_repo(stdin, uid, gid)
 
-    netlog = NetLog(f"{TRACE}/net.jsonl")
+    netlog = NetLog(f"{META}/net.jsonl")
+    mint = Mint()
     if job.get("network") == "offline":
-        start_sinkhole(netlog)
+        mint.setup()
+        start_sinkhole(netlog, mint)
         time.sleep(0.2)
 
     env = {
@@ -391,17 +711,29 @@ def main():
         "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_BREAK_SYSTEM_PACKAGES": "1",
     }
     env.update(job.get("env", {}))
+    if mint.ok:   # offline only: make the workload trust the sinkhole CA
+        bundle = f"{PUB}/ca-bundle.crt"
+        env.update({"NODE_EXTRA_CA_CERTS": f"{PUB}/ca.crt", "SSL_CERT_FILE": bundle, "REQUESTS_CA_BUNDLE": bundle,
+                    "CURL_CA_BUNDLE": bundle, "PIP_CERT": bundle, "GIT_SSL_CAINFO": bundle})
 
+    before = snapshot()
     results = []
     for phase in job.get("phases", []):
         log(f"phase {phase['name']}: {phase['cmd']}")
         results.append(run_phase(phase, env, uid))
+    kill_runner(uid)
+    with open(f"{META}/files.json", "w") as f:
+        json.dump(diff(before, snapshot()), f)
 
-    with open(f"{TRACE}/meta.json", "w") as f:
-        json.dump({"phases": results, "network": job.get("network")}, f)
-    netlog.f.close()
+    with open(f"{META}/meta.json", "w") as f:
+        json.dump({"phases": results, "network": job.get("network"), "sinkhole_degraded": DEGRADED.is_set()}, f)
+    with netlog.lock:
+        netlog.f.close()
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as tf:
         tf.add(TRACE, arcname="trace")
+        for n in os.listdir(META):
+            if n != "ca":   # the CA key stays behind
+                tf.add(os.path.join(META, n), arcname=f"trace/{n}")
     sys.stdout.buffer.flush()
 
 

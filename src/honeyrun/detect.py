@@ -21,28 +21,45 @@ class Plan:
     lifecycle: dict[str, str] = field(default_factory=dict)
 
 
+def _strs(v) -> dict[str, str]:
+    return {k: x for k, x in v.items() if isinstance(k, str) and isinstance(x, str)} if isinstance(v, dict) else {}
+
+
+def _exists(repo: Path, rel: object) -> bool:
+    try:
+        return isinstance(rel, str) and bool(rel) and (repo / rel).exists()
+    except (OSError, ValueError):
+        return False
+
+
 def _node(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | None]:
     try:
         pkg = json.loads((repo / "package.json").read_text())
     except (OSError, ValueError):
         pkg = {}
+    if not isinstance(pkg, dict):
+        pkg = {}
     deps: set[str] = set()
     for key in ("dependencies", "devDependencies", "peerDependencies"):
-        deps |= set((pkg.get(key) or {}).keys())
+        if isinstance(pkg.get(key), dict):
+            deps |= {k for k in pkg[key] if isinstance(k, str)}
     plan.mcp = bool(deps & MCP_NODE_DEPS)
-    scripts = pkg.get("scripts") or {}
+    scripts = _strs(pkg.get("scripts"))
     plan.lifecycle = {k: scripts[k] for k in LIFECYCLE if k in scripts}
 
     install = "npm install --no-audit --no-fund"
     bin_ = pkg.get("bin")
-    bin_path = next(iter(bin_.values()), None) if isinstance(bin_, dict) else bin_
+    if isinstance(bin_, dict):
+        bin_path = next((v for v in bin_.values() if isinstance(v, str) and v), None)
+    else:
+        bin_path = bin_ if isinstance(bin_, str) and bin_ else None
     main = pkg.get("main")
     run = None
     if plan.mcp and bin_path:
         run = f"node {shlex.quote(bin_path)}"
     elif "start" in scripts:
         run = "npm start --silent"
-    elif main and (repo / main).exists():
+    elif _exists(repo, main):
         run = f"node {shlex.quote(main)}"
     elif bin_path:
         run = f"node {shlex.quote(bin_path)}"
@@ -53,19 +70,25 @@ def _node(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | None
 
 def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | None]:
     deps: list[str] = []
-    scripts: dict = {}
+    scripts: list[str] = []
     pyproject = repo / "pyproject.toml"
     if pyproject.exists():
         try:
             data = tomllib.loads(pyproject.read_text())
-            project = data.get("project") or {}
-            deps += project.get("dependencies") or []
-            scripts = project.get("scripts") or {}
+            project = data.get("project") if isinstance(data, dict) else None
+            project = project if isinstance(project, dict) else {}
+            if isinstance(project.get("dependencies"), list):
+                deps += [d for d in project["dependencies"] if isinstance(d, str)]
+            if isinstance(project.get("scripts"), dict):
+                scripts = [k for k in project["scripts"] if isinstance(k, str) and k]
         except (OSError, ValueError):
             pass
     req = repo / "requirements.txt"
     if req.exists():
-        deps += req.read_text(errors="replace").splitlines()
+        try:
+            deps += req.read_text(errors="replace").splitlines()
+        except OSError:
+            pass
     plan.mcp = any(MCP_PY_DEPS.match(d) for d in deps)
 
     install = None
@@ -78,7 +101,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
 
     run = None
     if scripts and install:
-        run = shlex.quote(next(iter(scripts)))
+        run = shlex.quote(scripts[0])
     else:
         for name in ("server.py", "main.py", "app.py", "__main__.py"):
             if (repo / name).exists():

@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, bait, detect, report
+from . import __version__, bait, detect, report, review, static
 from .analyze import SEVERITIES, analyze
 from .sandbox import SandboxError, ensure_image, pick_runtime, run_job
 
@@ -67,27 +67,39 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-trace", metavar="DIR", help="save raw strace, sinkhole and MCP logs here")
     ap.add_argument("--fail-on", choices=SEVERITIES[1:], default="high",
                     help="exit 1 when a finding at or above this severity exists (default: high)")
+    ap.add_argument("--static-only", action="store_true",
+                    help="only read the repo (hooks, manifests, agent configs); run nothing, no Docker needed")
+    ap.add_argument("--agent", action="store_true",
+                    help="compact output for coding agents (Claude Code, Codex, Gemini CLI, Cursor...): few tokens")
+    ap.add_argument("--review", metavar="CMD",
+                    help="ask an AI CLI for a second opinion on WARN results only, e.g. \"claude -p\", "
+                         "\"codex exec -\", \"gemini -p {prompt_file}\". Advisory: never changes the exit code")
     ap.add_argument("-v", "--verbose", action="store_true", help="also show info findings")
     ap.add_argument("--version", action="version", version=f"honeyrun {__version__}")
     args = ap.parse_args(argv)
 
     cleanup = None
+    trace: dict[str, bytes] = {}
+    runtime_label = "none (static scan only)"
     try:
-        runtime = pick_runtime(args.runtime, args.allow_runc)
         src, label, cleanup = fetch(args.target, args.ref)
         if args.subdir:
             sub = (src / args.subdir).resolve()
-            if not sub.is_dir() or src.resolve() not in sub.parents:
+            if not sub.is_dir() or (sub != src.resolve() and src.resolve() not in sub.parents):
                 raise SandboxError(f"--subdir {args.subdir} is not a directory inside the repo")
             src, label = sub, f"{label} ({args.subdir})"
+        pre = static.scan(src)
         plan = detect.plan(src, args.network, args.install, args.run, args.install_timeout,
                            args.run_timeout, args.mcp)
         baits = bait.generate()
-        job = {"network": args.network, "phases": plan.phases,
-               "files": bait.files(baits), "env": bait.env(baits)}
-        image = ensure_image()
-        budget = sum(p["timeout"] for p in plan.phases) + 120
-        trace = run_job(src, job, runtime, image, timeout=budget)
+        if not args.static_only:
+            runtime = pick_runtime(args.runtime, args.allow_runc)
+            runtime_label = runtime.label
+            job = {"network": args.network, "phases": plan.phases,
+                   "files": bait.files(baits), "env": bait.env(baits)}
+            image = ensure_image(quiet=args.agent)
+            budget = sum(p["timeout"] for p in plan.phases) + 120
+            trace = run_job(src, job, runtime, image, timeout=budget)
     except SandboxError as e:
         print(f"honeyrun: {e}", file=sys.stderr)
         return 3
@@ -95,23 +107,29 @@ def main(argv: list[str] | None = None) -> int:
         if cleanup:
             shutil.rmtree(cleanup, ignore_errors=True)
 
-    if args.keep_trace:
+    if args.keep_trace and trace:
         out = Path(args.keep_trace)
         out.mkdir(parents=True, exist_ok=True)
         for name, data in trace.items():
             (out / name.lstrip("_")).write_bytes(data)
 
     result = analyze(trace, baits, args.network)
-    if plan.lifecycle:
-        from .analyze import Finding
-        for hook, cmd in plan.lifecycle.items():
-            result.findings.append(Finding("info", "lifecycle-script", f"declares {hook}: {cmd[:80]}", phase="install"))
+    result.findings = sorted(result.findings + pre,
+                             key=lambda f: (-SEVERITIES.index(f.severity), f.rule, f.title))
 
-    ctx = {"target": label, "runtime": runtime.label, "network": args.network,
-           "baits": len(baits), "mcp": plan.mcp}
-    report.terminal(result, ctx, show_info=args.verbose)
+    ctx = {"target": label, "runtime": runtime_label, "network": args.network if trace else "not run",
+           "baits": len(baits) if trace else 0, "mcp": plan.mcp and bool(trace)}
+    note = None
+    if args.review and report.verdict(result.findings) == "WARN":
+        note = review.run(args.review, result, ctx)
+    if args.agent:
+        report.agent(result, ctx, note)
+    else:
+        report.terminal(result, ctx, show_info=args.verbose)
+        if note:
+            print("\nAI review (advisory, does not change the exit code):\n" + note)
     if args.json:
-        Path(args.json).write_text(report.to_json(result, ctx))
+        Path(args.json).write_text(report.to_json(result, ctx, note))
     if args.markdown:
         Path(args.markdown).write_text(report.to_markdown(result, ctx))
 

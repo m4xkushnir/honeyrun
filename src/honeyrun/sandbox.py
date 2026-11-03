@@ -1,6 +1,7 @@
 """Build the sandbox image and run one job in a disposable container."""
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import io
 import json
@@ -9,6 +10,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from importlib import resources
@@ -76,11 +79,81 @@ def ensure_image(quiet: bool = False) -> str:
     return tag
 
 
+# Files that hold real credentials: never shipped unless git tracks them (then they are the repo).
+SECRET_NAMES = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".npmrc", ".pypirc", ".netrc",
+                "credentials.json")
+GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
+GIT_HARDEN = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+MAX_TRACE = 1536 * 1024 * 1024    # container stdout, on disk
+MAX_MEMBER = 512 * 1024 * 1024    # one trace file, in memory
+
+
+def _is_secret(rel: str) -> bool:
+    parts = rel.split("/")
+    return "secrets" in parts[:-1] or any(fnmatch.fnmatch(parts[-1], pat) for pat in SECRET_NAMES)
+
+
+def _git_files(src: Path, *flags: str) -> list[str] | None:
+    try:
+        res = subprocess.run([*GIT_HARDEN, "-C", str(src), "ls-files", *flags, "-z"], capture_output=True,
+                             env={**os.environ, **GIT_ENV}, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if res.returncode != 0:
+        return None
+    return [p for p in res.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
+
+
+def _walk_files(src: Path) -> list[str]:
+    out = []
+    for d, dirs, files in os.walk(src):
+        dirs[:] = [x for x in dirs if x != ".git"]
+        rel_d = os.path.relpath(d, src)
+        for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]:
+            if n != ".git":
+                out.append(n if rel_d == "." else f"{rel_d}/{n}")
+    return out
+
+
+def _add(tf: tarfile.TarFile, src: Path, root: str, rel: str) -> None:
+    path = src / rel
+    if os.path.islink(path) and not (os.path.realpath(path) + os.sep).startswith(root + os.sep):
+        return   # points outside the source tree
+    try:
+        tf.inodes.clear()   # hard links must travel as plain files: the agent drops link members
+        info = tf.gettarinfo(str(path), arcname="./" + rel)
+        if info.isdev() or info.isdir():   # gitlinks and sockets
+            return
+        if info.isreg():
+            with open(path, "rb") as f:
+                tf.addfile(info, f)
+        else:
+            tf.addfile(info)
+    except OSError:
+        pass
+
+
 def pack(src: Path) -> bytes:
-    """The repo travels into the sandbox as a tar on stdin: no host path is ever mounted."""
+    """The repo travels into the sandbox as a tar on stdin: no host path is ever mounted.
+
+    .git never goes in (a checkout leaves its token in .git/config). In a git work tree only
+    tracked and unignored files go; credential-looking files go only if git tracks them.
+    """
+    root = os.path.realpath(src)
+    tracked = _git_files(src, "--cached") if (src / ".git").exists() else None
+    files = _git_files(src, "--cached", "--others", "--exclude-standard") if tracked is not None else None
+    if files is None:
+        tracked, files = [], _walk_files(src)
+    tracked = set(tracked)
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        tf.add(str(src), arcname=".", filter=lambda m: None if m.isdev() else m)
+        for rel in sorted(set(files)):
+            parts = rel.split("/")
+            if ".." in parts or rel.startswith("/") or parts[0] == ".git":
+                continue
+            if rel not in tracked and _is_secret(rel):
+                continue
+            _add(tf, src, root, rel)
     return buf.getvalue()
 
 
@@ -94,8 +167,10 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
         "--hostname", "devbox",
         "--read-only",
         "--cap-drop", "ALL",
-        # root agent only: plant bait, drop to `runner`, trace it, kill it, bind :53/:80/:443
-        "--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID",
+        # Root agent only: plant bait, drop to `runner`, trace it, kill it, bind :53/:80/:443,
+        # and read (never write) the runner's files for the before/after snapshot.
+        # The workload runs as uid 1001 and holds none of these.
+        "--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "DAC_READ_SEARCH",
         "--cap-add", "SYS_PTRACE", "--cap-add", "KILL", "--cap-add", "NET_BIND_SERVICE",
         "--security-opt", "no-new-privileges",
         "--pids-limit", "512", "--memory", memory, "--cpus", cpus,
@@ -103,31 +178,97 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
         "--tmpfs", "/home/runner:rw,exec,size=512m",
         "--tmpfs", "/tmp:rw,exec,size=512m",
         "--tmpfs", "/trace:rw,size=512m,mode=0700",
+        # Small and separate, so a workload that floods /trace cannot cost us net.jsonl or meta.json.
+        "--tmpfs", "/trace-meta:rw,size=32m,mode=0700",
     ]
     if job["network"] == "offline":
         (tmp / "resolv.conf").write_text("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+        # Root writes the CA bundle here; the runner can read it but never change it.
+        args += ["--tmpfs", "/run/honeyrun:rw,size=4m,mode=0755"]
         args += ["--network", "none", "-v", f"{tmp / 'resolv.conf'}:/etc/resolv.conf:ro"]
     else:
         args += ["--network", "bridge"]
     args.append(image)
 
+    payload = json.dumps(job).encode() + b"\n" + pack(src)
+    out_f = tempfile.NamedTemporaryFile(prefix="honeyrun-trace-", delete=False)
+    err_f = tempfile.NamedTemporaryFile(prefix="honeyrun-err-", delete=False)
     try:
-        proc = subprocess.run(["docker", *args], input=json.dumps(job).encode() + b"\n" + pack(src),
-                              capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _docker("kill", name)
-        raise SandboxError(f"sandbox did not finish within {timeout}s and was killed")
+        try:
+            _run_container(args, name, payload, out_f, err_f, timeout)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        out_f.flush()
+        if os.path.getsize(out_f.name) == 0:
+            raise SandboxError("sandbox produced no trace:\n" + _tail(err_f.name).decode(errors="replace")[-2000:])
+        out = _read_trace(out_f.name)
+        out["_agent.stderr"] = _tail(err_f.name)
+        return out
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    if not proc.stdout:
-        raise SandboxError("sandbox produced no trace:\n" + proc.stderr.decode(errors="replace")[-2000:])
+        for f in (out_f, err_f):
+            f.close()
+            try:
+                os.unlink(f.name)
+            except OSError:
+                pass
 
+
+def _tail(path: str, n: int = 1 << 20) -> bytes:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - n))
+        return f.read()
+
+
+def _run_container(args, name, payload, out_f, err_f, timeout) -> None:
+    proc = subprocess.Popen(["docker", *args], stdin=subprocess.PIPE, stdout=out_f, stderr=err_f)
+
+    def feed():
+        try:
+            proc.stdin.write(payload)
+        except OSError:
+            pass   # the container exited early; its stderr says why
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    end = time.monotonic() + timeout
+    while proc.poll() is None:
+        if time.monotonic() > end:
+            _docker("kill", name)
+            proc.kill()
+            proc.wait()
+            raise SandboxError(f"sandbox did not finish within {timeout}s and was killed")
+        if os.fstat(out_f.fileno()).st_size > MAX_TRACE:
+            _docker("kill", name)
+            proc.kill()
+            proc.wait()
+            raise SandboxError("trace too large")
+        time.sleep(0.2)
+
+
+def _read_trace(path: str) -> dict[str, bytes]:
     out: dict[str, bytes] = {}
-    with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:gz") as tf:
-        for member in tf:
-            if member.isfile():
+    cut: list[str] = []
+    try:
+        with tarfile.open(path, mode="r:gz") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
                 f = tf.extractfile(member)
-                if f:
-                    out[os.path.basename(member.name)] = f.read()
-    out["_agent.stderr"] = proc.stderr
+                if not f:
+                    continue
+                key = os.path.basename(member.name)
+                out[key] = f.read(MAX_MEMBER)
+                if member.size > MAX_MEMBER:
+                    cut.append(key)
+    except (tarfile.TarError, EOFError, OSError) as e:
+        if not out:
+            raise SandboxError(f"trace unreadable: {e}")
+        cut.append("_incomplete")
+    if cut:
+        out["_truncated"] = "\n".join(cut).encode()
     return out

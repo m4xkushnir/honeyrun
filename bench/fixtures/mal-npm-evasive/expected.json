@@ -1,0 +1,1 @@
+{ "verdict": "FAIL", "rules": ["sandbox-detection", "secret-in-output"] }

