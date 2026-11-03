@@ -141,6 +141,11 @@ class Workflows(unittest.TestCase):
         self.assertEqual(rules({".github/workflows/c.yml": commented}), set())
 
 
+# Windows needs Developer Mode to create symlinks, and git there checks repo symlinks out as text files.
+NO_SYMLINKS = os.name == "nt"
+
+
+@unittest.skipIf(NO_SYMLINKS, "symlinks are not available on this Windows runner")
 class Symlinks(unittest.TestCase):
     def test_credential_targets_are_high(self):
         self.assertTrue(has({"a.txt": "x"}, "high", "symlink-escape", links={"k": "/root/.ssh/id_rsa"}))
@@ -259,6 +264,7 @@ class Robust(unittest.TestCase):
 class Fixtures(unittest.TestCase):
     FIX = Path(__file__).resolve().parent.parent / "bench" / "fixtures"
 
+    @unittest.skipIf(NO_SYMLINKS, "the fixture's symlink is checked out as a text file on Windows")
     def test_rare_fixture_hits_every_listed_rule(self):
         exp = json.loads((self.FIX / "mal-static-rare" / "expected.json").read_text())
         got = {f.rule for f in scan(self.FIX / "mal-static-rare") if f.severity != "info"}
