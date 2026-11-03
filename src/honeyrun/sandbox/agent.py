@@ -315,7 +315,7 @@ def run_phase(phase, env, uid):
             main_pid = child_of(proc.pid)
         elif main_done_at is None and proc_state(main_pid) in (None, "Z", "X"):
             main_done_at = now
-        if main_done_at is not None and now - main_done_at > 2:
+        if main_done_at is not None and now - main_done_at > 5 and proc_state(main_pid) in (None, "Z", "X"):
             # The command itself finished but something it started is still alive.
             lingering = [{"pid": p, "cmdline": cmdline(p)} for p in runner_pids(uid)]
             kill_runner(uid)
@@ -338,13 +338,14 @@ def run_phase(phase, env, uid):
 
 
 def chown_tree(path, uid, gid):
-    os.lchown(path, uid, gid)
-    for root, dirs, files in os.walk(path):
+    # Bottom-up: root has no CAP_DAC_OVERRIDE, so it must list a directory before giving it away.
+    for root, dirs, files in os.walk(path, topdown=False):
         for n in dirs + files:
             try:
                 os.lchown(os.path.join(root, n), uid, gid)
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"chown {n}: {e}")
+    os.lchown(path, uid, gid)
 
 
 def plant(files, uid, gid):
@@ -373,6 +374,8 @@ def main():
             if name.startswith(("/", "..")) or member.isdev() or member.islnk():
                 continue
             tf.extract(member, WORK, set_attrs=False)
+            if not member.issym():
+                os.chmod(os.path.join(WORK, name), 0o755 if member.isdir() or member.mode & 0o111 else 0o644)
     chown_tree("/workspace", uid, gid)
 
     netlog = NetLog(f"{TRACE}/net.jsonl")

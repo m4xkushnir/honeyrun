@@ -98,7 +98,7 @@ class Proc:
         return os.path.basename(self.exe)
 
     def label(self, width: int = 72) -> str:
-        cmd = " ".join(self.argv) if self.argv else self.exe
+        cmd = re.sub(r"\s+", " ", " ".join(self.argv) if self.argv else self.exe).strip()
         cmd = cmd.replace(HOME, "~")
         return cmd if len(cmd) <= width else cmd[:width - 3] + "..."
 

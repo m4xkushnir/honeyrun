@@ -13,8 +13,8 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install -e .
@@ -23,8 +23,8 @@ jobs:
   bench-gvisor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: bash scripts/install-gvisor.sh
@@ -34,7 +34,7 @@ jobs:
       - if: always()
         run: cat bench/out/RESULTS.md >> "$GITHUB_STEP_SUMMARY"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-results
           path: bench/out/
@@ -42,7 +42,7 @@ jobs:
   action:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Benign fixture passes
         uses: ./
         with:
@@ -58,8 +58,8 @@ jobs:
   real-repos-gvisor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: bash scripts/install-gvisor.sh
@@ -69,7 +69,7 @@ jobs:
       - if: always()
         run: cat bench/out/REAL.md >> "$GITHUB_STEP_SUMMARY"
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: real-repos
           path: bench/out/

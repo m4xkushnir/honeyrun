@@ -111,7 +111,10 @@ def real(args, out: Path) -> int:
     (out / "REAL.md").write_text("\n".join(md) + "\n")
     (out / "real.json").write_text(json.dumps(rows, indent=2))
     print("\n".join(md))
-    return 1 if any(r["verdict"] == "ERROR" for r in rows) else 0
+    broken = [r["repo"] for r in rows if r["verdict"] == "ERROR" or r["phases"].get("install", 0) != 0]
+    if broken:
+        print(f"install failed or sandbox error: {broken}", file=sys.stderr)
+    return 1 if broken else 0
 
 
 if __name__ == "__main__":
