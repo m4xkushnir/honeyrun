@@ -21,16 +21,22 @@
 
 </div>
 
-You found a package, an MCP server or a repo your coding agent wants to install. honeyrun runs it for you first, in a throwaway sandbox whose home folder is full of fake keys: SSH, AWS, GitHub, npm, and the configs of Claude, Codex, Cursor and Gemini. Each key is made up for that run. If one turns up in a web request, a DNS lookup or a log line, you know exactly what took it and where it went.
+Your coding agent installs packages, clones repos and adds MCP servers for you now. One `postinstall` script or one poisoned tool description can read `~/.ssh`, `~/.aws` and your agent's API keys before you notice. Reading the code first doesn't help much when the payload is base64, waits a month, or only wakes up inside CI.
 
-Before running anything it reads the code for hooks and hidden instructions. While it runs, it watches every process, file and connection. Then it runs the code again with the clock 45 days ahead, for code that waits. You get one line at the end: **LOOKS SAFE**, **UNCLEAR** or **NOT SAFE**, and what to do next.
-
-## Try it
+honeyrun runs it for you first, in a throwaway sandbox whose home folder is full of fake keys: SSH, AWS, GitHub, npm, and the configs of Claude, Codex, Cursor and Gemini. Each key is made up for that run. If one turns up in a web request, a DNS lookup or a log line, you know exactly what took it and where it went.
 
 ```bash
 pipx install git+https://github.com/m4xkushnir/honeyrun
-honeyrun owner/some-mcp-server
+honeyrun npm:some-package        # or owner/repo, pypi:name, a folder, an MCP server
 ```
+
+Before running anything it reads the code for hooks and hidden instructions. While it runs, it watches every process, file and connection. Then it runs the code again with the clock 45 days ahead, for code that waits. You get one line at the end: **LOOKS SAFE**, **UNCLEAR** or **NOT SAFE**, and what to do next.
+
+- **One command, no account, no server.** Runs on your laptop or in a GitHub Action. Zero Python dependencies.
+- **Catches what scanners can't read.** Encrypted, obfuscated and delayed payloads show themselves when they run.
+- **Built for the agent era.** It calls every MCP tool, spots instructions hidden for your AI, notices when a tool quietly changes after you approved it, and gives your agent a short answer it can act on.
+
+## Try it
 
 Point it at whatever you're about to trust:
 
@@ -195,6 +201,12 @@ honeyrun shows you what a piece of code does when it runs. A few things deserve 
 honeyrun has no telemetry and no server. It goes online only to fetch what you asked it to check, to look the target up in OSV and GitHub (`--no-intel` turns that off; local folders are never looked up unless you ask), and to call your own AI if you pass `--review`. Reports mask tokens and URL passwords and write `~` for your home folder. Your history of checks stays on your machine.
 
 Check code you're allowed to run, and send reports through official channels. honeyrun is provided as is, without warranty. Read [DISCLAIMER.md](DISCLAIMER.md) for the full terms and [SECURITY.md](SECURITY.md) to report a problem in honeyrun itself.
+
+## Contributing
+
+Found malware it missed, or a false alarm on a real project? Open an issue with the package name, or better, a small fixture in `bench/fixtures/`: every fixture becomes a test that runs on each push. Security problems in honeyrun itself go through [SECURITY.md](SECURITY.md). AI agents working on this repo: read [AGENTS.md](AGENTS.md) first.
+
+If honeyrun caught something for you, a star helps the next person find it.
 
 ## License
 
