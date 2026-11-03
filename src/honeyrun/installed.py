@@ -80,7 +80,7 @@ def _grade(cmd: str) -> str:
 
 def _read(p: Path, limit: int = 1_000_000) -> str:
     try:
-        return p.read_text(errors="replace")[:limit]
+        return p.read_text(encoding="utf-8", errors="replace")[:limit]
     except OSError:
         return ""
 

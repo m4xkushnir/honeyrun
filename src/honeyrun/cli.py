@@ -127,6 +127,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true", help="also show info findings")
     ap.add_argument("--version", action="version", version=f"honeyrun {__version__}")
     args = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")   # untrusted Unicode must never crash a cp1252 console
+        except (AttributeError, ValueError):
+            pass
     if args.agent_configs and not args.target:
         return _agent_configs(args)
     if not args.target:
@@ -206,12 +211,12 @@ def _manifest_identity(src: Path, ecosystem: str) -> dict | None:
     """Name and version a registry would know this repo by, for OSV."""
     try:
         if ecosystem == "node":
-            meta = json.loads((src / "package.json").read_text())
+            meta = json.loads((src / "package.json").read_text(encoding="utf-8"))
             if isinstance(meta, dict) and isinstance(meta.get("name"), str):
                 return {"ecosystem": "npm", "name": meta["name"], "version": str(meta.get("version") or "")}
         if ecosystem == "python":
             import tomllib
-            proj = (tomllib.loads((src / "pyproject.toml").read_text()).get("project") or {})
+            proj = (tomllib.loads((src / "pyproject.toml").read_text(encoding="utf-8")).get("project") or {})
             if isinstance(proj.get("name"), str):
                 return {"ecosystem": "PyPI", "name": proj["name"], "version": str(proj.get("version") or "")}
     except (OSError, ValueError, AttributeError):
@@ -257,14 +262,14 @@ def _finish(args, result, ctx) -> int:
         if note:
             print("\nAI review (advisory, does not change the exit code):\n" + report.note_text(note))
     if args.json:
-        Path(args.json).write_text(report.to_json(result, ctx, report.note_text(note) if note else None))
+        Path(args.json).write_text(report.to_json(result, ctx, report.note_text(note) if note else None), encoding="utf-8")
     if args.markdown:
-        Path(args.markdown).write_text(report.to_markdown(result, ctx))
+        Path(args.markdown).write_text(report.to_markdown(result, ctx), encoding="utf-8")
     if args.sarif:
-        Path(args.sarif).write_text(report.to_sarif(result, ctx, __version__))
+        Path(args.sarif).write_text(report.to_sarif(result, ctx, __version__), encoding="utf-8")
     text = report.abuse(result, ctx, __version__) if v == "FAIL" else ""
     if args.abuse_report and text:
-        Path(args.abuse_report).write_text(text)
+        Path(args.abuse_report).write_text(text, encoding="utf-8")
     elif text and not args.agent and not args.json:
         print("\nTo report it, run again with --abuse-report FILE for a ready-to-paste report.")
 

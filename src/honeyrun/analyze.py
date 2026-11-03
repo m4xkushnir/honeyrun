@@ -5,6 +5,7 @@ import base64
 import ipaddress
 import json
 import os
+import posixpath
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -180,7 +181,7 @@ def unescape(s: str) -> str:
 
 
 def norm(path: str) -> str:
-    path = os.path.normpath(path)
+    path = posixpath.normpath(path)
     return "/" + path.lstrip("/") if path.startswith("/") else path
 
 
@@ -202,7 +203,7 @@ class Proc:
 
     @property
     def name(self) -> str:
-        return os.path.basename(self.exe)
+        return posixpath.basename(self.exe)
 
     def label(self, width: int = 72) -> str:
         cmd = re.sub(r"\s+", " ", " ".join(self.argv) if self.argv else self.exe).strip()
@@ -321,7 +322,7 @@ def parse_strace_counted(raw: str, phase: str) -> tuple[list[Event], int]:
                 cwd = unescape(base.group(1)) if base else WORK
                 if not cwd.startswith("/"):
                     cwd = WORK
-                path = os.path.join(cwd, path)
+                path = posixpath.join(cwd, path)
             path = norm(path)
             write = name == "creat" or bool(re.search(r"O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND", args))
             events.append(Event(phase, "open", pid, p, {"path": path, "write": write, "ok": ok, "err": err,
@@ -456,7 +457,7 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             rel = path.replace(HOME, "~")
             readers = EXPECTED_READERS.get(b.path, ())
             reader = next((r for r in readers for a in [ev.proc.exe, *ev.proc.argv[:2]]
-                           if os.path.basename(a) == r or f"/{r}-cli" in a), None)
+                           if posixpath.basename(a) == r or f"/{r}-cli" in a), None)
             if reader:
                 add("info", "bait-read-expected", rel, f"{rel} read by {reader} (its own config)", phase=ev.phase)
             else:
@@ -512,7 +513,7 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
     for ev in execs:
         argv = ev.data["argv"]
         joined = " ".join(argv)
-        base = os.path.basename(ev.data["path"])
+        base = posixpath.basename(ev.data["path"])
         script = argv[2] if len(argv) >= 3 and argv[1] == "-c" else ""
         if re.search(r"/dev/(tcp|udp)/", joined) or (base in ("nc", "ncat", "netcat") and re.search(r"\s-[ec]\s", f" {joined} ")) \
                 or (base == "socat" and "exec:" in joined.lower()):
@@ -530,9 +531,9 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                 add("info", "decoded-payload", decoded[:30], "decoded the inline payload", decoded[:300], ev.phase)
         name0 = argv[0] if argv else ""
         # an interpreter that renames itself in argv[0] (python as "systemd") is hiding in `ps`
-        renamed = bool(name0) and os.path.basename(name0) != base and not DISGUISE.match(base) \
-            and bool(DISGUISE.match(os.path.basename(name0)))
-        if ev.data["ok"] and (name0.startswith("[") or renamed or (DISGUISE.match(os.path.basename(name0) or base)
+        renamed = bool(name0) and posixpath.basename(name0) != base and not DISGUISE.match(base) \
+            and bool(DISGUISE.match(posixpath.basename(name0)))
+        if ev.data["ok"] and (name0.startswith("[") or renamed or (DISGUISE.match(posixpath.basename(name0) or base)
                                                        and not ev.data["path"].startswith(("/usr/", "/bin/", "/sbin/", "/lib")))):
             add("high", "disguised-process", name0[:40] or base,
                 f"runs a process disguised as a system process: {name0[:40] or base}", f"{ev.data['path']} {joined[:120]}", ev.phase)
@@ -789,7 +790,7 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
     for ev in execs:
         for a in [ev.data["path"], *ev.data["argv"][1:4]]:
             if a and not a.startswith("-") and len(a) < 300:
-                executed.add(norm(a if a.startswith("/") else os.path.join(WORK, "repo", a)))
+                executed.add(norm(a if a.startswith("/") else posixpath.join(WORK, "repo", a)))
     outside: list[str] = []
     for kind in ("created", "modified", "deleted"):
         for path, size, mode, head in files.get(kind, []):
@@ -817,7 +818,7 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                 add("medium", "anti-forensics", path, f"deletes its own traces ({short})", "shell history removed")
                 continue
             if kind == "deleted" and path.startswith(WORK + "/") and (
-                    path in executed or SELF_SCRIPT.search(os.path.basename(path)) or "/.husky/" in path):
+                    path in executed or SELF_SCRIPT.search(posixpath.basename(path)) or "/.husky/" in path):
                 add("medium", "anti-forensics", path, f"deletes its own traces ({path.replace(WORK + '/repo/', '')})",
                     "a script that ran during the phases was removed afterwards")
                 continue

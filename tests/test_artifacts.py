@@ -103,9 +103,11 @@ class Archives(unittest.TestCase):
 
     def test_nothing_is_extracted_to_disk(self):
         r = repo({"a.zip": zipped({"../escape.txt": "x", "d/f.txt": "y"})})
-        before = {p for p in r.parent.rglob("*")}
+        before = {p for p in r.rglob("*")}
         scan(r)
-        self.assertEqual({p for p in r.parent.rglob("*")}, before)
+        # only our own dirs: the shared temp dir changes under other processes
+        self.assertEqual({p for p in r.rglob("*")}, before)
+        self.assertFalse((r.parent / "escape.txt").exists())
 
     def test_zip_bomb_by_ratio(self):
         big = zipped({"zeros.bin": b"\x00" * (8 * 1024 * 1024)})

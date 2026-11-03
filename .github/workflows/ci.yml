@@ -17,6 +17,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"   # test fixtures write Unicode; the code itself sets UTF-8 explicitly
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

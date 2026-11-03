@@ -100,7 +100,7 @@ def run(command: str, a: Analysis, ctx: dict, timeout: int = 180) -> str:
     try:
         if "{prompt_file}" in command:
             fd, tmp = tempfile.mkstemp(prefix="honeyrun-review-", suffix=".txt")
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(prompt)
             res = subprocess.run([x.replace("{prompt_file}", tmp) for x in argv],
                                  capture_output=True, text=True, timeout=timeout)

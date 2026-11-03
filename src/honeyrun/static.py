@@ -270,7 +270,7 @@ def _read(p: Path) -> str:
     try:
         if p.stat().st_size > MAX_BYTES:
             return ""
-        return p.read_text(errors="replace")
+        return p.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 

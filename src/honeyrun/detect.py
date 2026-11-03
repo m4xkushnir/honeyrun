@@ -37,7 +37,7 @@ def _exists(repo: Path, rel: object) -> bool:
 
 def _node(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | None]:
     try:
-        pkg = json.loads((repo / "package.json").read_text())
+        pkg = json.loads((repo / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pkg = {}
     if not isinstance(pkg, dict):
@@ -77,7 +77,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
     pyproject = repo / "pyproject.toml"
     if pyproject.exists():
         try:
-            data = tomllib.loads(pyproject.read_text())
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
             project = data.get("project") if isinstance(data, dict) else None
             project = project if isinstance(project, dict) else {}
             if isinstance(project.get("dependencies"), list):
@@ -89,7 +89,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
     req = repo / "requirements.txt"
     if req.exists():
         try:
-            deps += req.read_text(errors="replace").splitlines()
+            deps += req.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             pass
     plan.mcp = any(MCP_PY_DEPS.match(d) for d in deps)

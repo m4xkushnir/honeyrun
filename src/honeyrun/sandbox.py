@@ -239,7 +239,7 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
         "--tmpfs", "/trace-meta:rw,size=32m,mode=0700",
     ]
     if job["network"] == "offline":
-        (tmp / "resolv.conf").write_text("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+        (tmp / "resolv.conf").write_bytes(b"nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")   # LF even on Windows
         # Root writes the CA bundle here; the runner can read it but never change it.
         args += ["--tmpfs", "/run/honeyrun:rw,size=4m,mode=0755"]
         args += ["--network", "none", "-v", f"{tmp / 'resolv.conf'}:/etc/resolv.conf:ro"]
@@ -261,7 +261,7 @@ def _run_apple(src, job, runtime, image, timeout, memory, cpus, name) -> dict[st
     for path in ("/workspace", "/home/runner", "/tmp", "/trace", "/trace-meta", "/run/honeyrun"):
         args += ["--tmpfs", path]
     if job["network"] == "offline":
-        (tmp / "resolv.conf").write_text("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+        (tmp / "resolv.conf").write_bytes(b"nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")   # LF even on Windows
         args += ["--network", "none", "-v", f"{tmp / 'resolv.conf'}:/etc/resolv.conf:ro"]
     args.append(image)
     return _execute("container", args, name, job, src, timeout, tmp)

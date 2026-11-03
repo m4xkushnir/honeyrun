@@ -57,7 +57,7 @@ def snapshot(label: str, verdict: str, findings: list[Finding], hosts: list[dict
 
 def load(label: str) -> list[dict]:
     try:
-        return json.loads((_cache_dir() / f"{target_key(label)}.json").read_text()).get("runs", [])
+        return json.loads((_cache_dir() / f"{target_key(label)}.json").read_text(encoding="utf-8")).get("runs", [])
     except (OSError, ValueError, AttributeError):
         return []
 
@@ -68,7 +68,7 @@ def save(label: str, snap: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"target": label.split(" @ ")[0], "runs": runs}, indent=1))
+        tmp.write_text(json.dumps({"target": label.split(" @ ")[0], "runs": runs}, indent=1), encoding="utf-8")
         os.replace(tmp, path)
     except OSError:
         pass   # history is a convenience; never fail a check over it

@@ -566,7 +566,7 @@ def inspect_image(p: Path, rel: str, size: int, budget: Budget) -> list[Hit]:
         if size > 2 * 1024 * 1024 or not budget.take(size):
             return []
         try:
-            m = _SVG_ACTIVE.search(p.read_text(errors="replace"))
+            m = _SVG_ACTIVE.search(p.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             return []
         if m:
