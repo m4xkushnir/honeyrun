@@ -87,15 +87,48 @@ flowchart LR
 
 ## Benchmark
 
-Two checks run on every push in [CI](.github/workflows/ci.yml), under gVisor on `ubuntu-latest`.
+Both checks run on every push in [CI](.github/workflows/ci.yml), under gVisor on `ubuntu-latest`. The numbers below come from those runs.
 
 **Detection** on [15 synthetic fixtures](bench/fixtures): 10 malicious ones modelled on real incidents (postinstall SSH-key theft, `curl | sh` preinstall, DNS-tunnelled `GITHUB_TOKEN`, a `setup.py` AWS stealer, an MCP server that poisons its tool description and steals other agents' MCP configs, `.bashrc` + Claude Code hook persistence, reverse shell, base64-eval `.npmrc` theft, wallet probing, a detached beacon), and 5 benign ones that build, read their own config and serve MCP.
 
-<!-- bench:fixtures -->
+| Malicious flagged | Benign flagged | Exact rule match | Median time per run |
+|:---:|:---:|:---:|:---:|
+| **10 / 10** | **0 / 5** | **15 / 15** | **1.6 s** |
+
+<details>
+<summary>Per fixture</summary>
+
+| Fixture | Verdict | Rules fired |
+|---|---|---|
+| `mal-mcp-config-stealer` | FAIL | canary-exfil, bait-read, mcp-tool-poisoning, network |
+| `mal-npm-ssh-exfil` | FAIL | canary-exfil, bait-read, network |
+| `mal-npm-env-dns` | FAIL | canary-exfil, network |
+| `mal-npm-obfuscated-npmrc` | FAIL | canary-exfil, bait-read, obfuscation, network |
+| `mal-py-setup-aws` | FAIL | canary-exfil, bait-read, network |
+| `mal-py-wallet-probe` | FAIL | bait-read, credential-probe |
+| `mal-npm-persistence` | FAIL | persistence |
+| `mal-npm-curl-sh` | FAIL | remote-script, downloader, network |
+| `mal-npm-revshell` | FAIL | reverse-shell, network |
+| `mal-npm-daemon` | WARN | lingering-process, network |
+| `ok-mcp-server`, `ok-npm-build`, `ok-npm-cli`, `ok-py-package`, `ok-py-script` | PASS | none |
+
+</details>
 
 **False positives** on well-known repos with real network: chalk, slugify, express, itsdangerous, markupsafe, requests, and the official `fetch`, `time` and `git` MCP servers.
 
-<!-- bench:real -->
+| Repo | Install | Run | MCP tools called | Verdict |
+|---|:---:|:---:|:---:|:---:|
+| chalk/chalk | ok | | | PASS |
+| sindresorhus/slugify | ok | ok | | PASS |
+| expressjs/express | ok | ok | | PASS |
+| pallets/itsdangerous | ok | | | PASS |
+| pallets/markupsafe | ok | | | PASS |
+| psf/requests | ok | | | PASS |
+| modelcontextprotocol/servers `src/fetch` | ok | ok | 1 | PASS |
+| modelcontextprotocol/servers `src/time` | ok | ok | 2 | PASS |
+| modelcontextprotocol/servers `src/git` | ok | ok | 12 | PASS |
+
+**0 / 9 flagged**, with every install succeeding. The check fails CI if one doesn't, so a PASS can't hide a broken run.
 
 Reproduce: `python bench/run.py` and `python bench/run.py --real`.
 
