@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Install gVisor (runsc) and register it with Docker. Linux only; needs sudo.
+# Install gVisor (runsc) from its signed apt repository and register it with Docker.
+# Debian/Ubuntu; needs sudo.
 set -euo pipefail
 if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"runsc"'; then
   echo "runsc already registered"; exit 0
 fi
-url="https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)"
-dir="$(mktemp -d)"; cd "$dir"
-curl -fsSLO "$url/runsc" -fsSLO "$url/runsc.sha512" \
-     -fsSLO "$url/containerd-shim-runsc-v1" -fsSLO "$url/containerd-shim-runsc-v1.sha512"
-sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512
-chmod a+rx runsc containerd-shim-runsc-v1
-sudo mv runsc containerd-shim-runsc-v1 /usr/local/bin/
-sudo /usr/local/bin/runsc install
+sudo apt-get update -qq
+sudo apt-get install -y -qq apt-transport-https ca-certificates curl gnupg >/dev/null
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+  | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+sudo apt-get update -qq
+sudo apt-get install -y -qq runsc >/dev/null
+sudo runsc install
 sudo systemctl restart docker
 docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
-echo "runsc $(runsc --version | head -1) registered"
+echo "registered: $(runsc --version | head -1)"
