@@ -134,9 +134,27 @@ Other tools can read the results too: `--sarif` for GitHub code scanning and oth
 
 Every number here comes from CI, under gVisor on `ubuntu-latest`, on every push.
 
-<!-- bench:fixtures -->
+**Detection on [32 fixtures](bench/fixtures).** 25 imitate real malware: install hooks that steal SSH and AWS keys, `curl | sh`, tokens tunnelled out over DNS or HTTPS, an MCP server that poisons its tool description and steals other agents' configs, a time bomb that waits 30 days, a CI-only payload, cloud metadata theft, SSH agent hijack, a fake `git` in PATH, droppers, wipers, miners, disguised processes, webhook exfiltration and hooks hidden in editor and agent configs. 7 are ordinary projects that build, read their own config, serve MCP and ship images, archives and analytics.
 
-<!-- bench:real -->
+| Malicious flagged | Benign flagged | Exact rule match | Median time per check |
+|:---:|:---:|:---:|:---:|
+| **25 / 25** | **0 / 7** | **32 / 32** | **2.4 s** |
+
+**False positives on well-known projects, with real network and the time-shifted pass:**
+
+| Repo | Install | Run | MCP tools called | Verdict |
+|---|:---:|:---:|:---:|:---:|
+| chalk/chalk | ok | | | LOOKS SAFE |
+| sindresorhus/slugify | ok | ok | | LOOKS SAFE |
+| expressjs/express | ok | ok | | LOOKS SAFE |
+| pallets/itsdangerous | ok | | | LOOKS SAFE |
+| pallets/markupsafe | ok | | | LOOKS SAFE |
+| psf/requests | ok | | | LOOKS SAFE |
+| modelcontextprotocol/servers `src/fetch` | ok | ok | 1 | LOOKS SAFE |
+| modelcontextprotocol/servers `src/time` | ok | ok | 2 | LOOKS SAFE |
+| modelcontextprotocol/servers `src/git` | ok | ok | 12 | LOOKS SAFE |
+
+**0 of 9 flagged**, and every install succeeded. CI fails if one doesn't, so a clean result can't hide a broken run. The same fixtures also run under rootless Podman, with no Docker at all, and the unit tests run on Linux, macOS and Windows.
 
 Reproduce: `python bench/run.py` and `python bench/run.py --real`.
 

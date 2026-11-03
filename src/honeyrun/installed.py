@@ -165,7 +165,7 @@ def scan_dependencies(root: Path) -> list[Finding]:
         name = meta.get("name") if isinstance(meta.get("name"), str) else pkg.name
         twin = _typosquat(name)
         if twin:
-            add("medium", "typosquat", name, f"installed dependency '{name}' imitates '{twin}'", str(pkg.relative_to(root)))
+            add("medium", "typosquat", name, f"installed dependency '{name}' imitates '{twin}'", pkg.relative_to(root).as_posix())
         scripts = meta.get("scripts") if isinstance(meta.get("scripts"), dict) else {}
         for hook in LIFECYCLE:
             cmd = scripts.get(hook)
@@ -193,7 +193,7 @@ def scan_dependencies(root: Path) -> list[Finding]:
             try:
                 check(pkg)
             except Exception:  # one odd package must not hide the rest
-                add("info", "scan-error", str(pkg), f"could not parse installed package {pkg.name}", str(pkg.relative_to(root)))
+                add("info", "scan-error", str(pkg), f"could not parse installed package {pkg.name}", pkg.relative_to(root).as_posix())
     if state.get("truncated"):
         add("medium", "scan-incomplete", "max-packages", f"scan incomplete: more than {MAX_PACKAGES} installed packages, the rest were not checked")
     add("info", "installed-summary", "count", f"{state.get('count', 0)} installed packages checked")
@@ -213,7 +213,7 @@ def scan_dependencies(root: Path) -> list[Finding]:
                 if not re.search(r"^\s*import\s", body, re.M) or KNOWN_PTH.match(pth.name):
                     continue
                 sev = "high" if (HOT.search(body) or re.search(r"exec\(|eval\(|b64decode|urllib|socket|subprocess|os\.system", body)) else "medium"
-                add(sev, "auto-exec", str(pth), f"{pth.relative_to(root)} runs code at every Python start", body.strip()[:150])
+                add(sev, "auto-exec", str(pth), f"{pth.relative_to(root).as_posix()} runs code at every Python start", body.strip()[:150])
     return out
 
 
@@ -271,7 +271,7 @@ def scan_agent_configs(home: Path | None = None) -> list[Finding]:
     for agent, path in _agent_files(home):
         if not path.is_file():
             continue
-        where = "~/" + str(path.relative_to(home)) if path.is_relative_to(home) else str(path)
+        where = "~/" + path.relative_to(home).as_posix() if path.is_relative_to(home) else str(path)
         if path.suffix == ".toml":
             try:
                 cfg = tomllib.loads(_read(path))

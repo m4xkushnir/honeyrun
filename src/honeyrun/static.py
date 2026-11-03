@@ -9,6 +9,7 @@ host: nothing here executes repo code and nothing here needs an AI.
 from __future__ import annotations
 
 import json
+import posixpath
 import os
 import re
 import tomllib
@@ -226,8 +227,9 @@ def _is_watched(r: str, name: str) -> bool:
 
 def safe_rel(rel: str) -> str | None:
     """Normalised relative path, or None when it is absolute or climbs out of its directory."""
-    n = os.path.normpath(rel)
-    if os.path.isabs(n) or n == ".." or n.startswith(".." + os.sep) or n == ".":
+    # repo-relative paths are POSIX on every OS, so matching works the same on Windows
+    n = posixpath.normpath(str(rel).replace("\\", "/"))
+    if n.startswith("/") or re.match(r"^[A-Za-z]:", n) or n == ".." or n.startswith("../") or n == ".":
         return None
     return n
 
@@ -661,7 +663,7 @@ def _post(repo: Path, state: dict, ctx: dict, loaders, images: dict, scanner, ad
     """Checks that need the whole walk: symlinks, orphaned bytecode, steganography loaders, telemetry, budget."""
     root = os.path.realpath(repo)
     for p in state.get("symlinks", []):
-        r = str(p.relative_to(repo))
+        r = p.relative_to(repo).as_posix()
         try:
             tgt = os.readlink(p)
         except OSError:
@@ -687,7 +689,7 @@ def _post(repo: Path, state: dict, ctx: dict, loaders, images: dict, scanner, ad
             continue
         orphans = [n for n in pycs if not (d.parent / (n.split(".")[0] + ".py")).exists()]
         if orphans:
-            rd = str(d.relative_to(repo))
+            rd = d.relative_to(repo).as_posix()
             add("medium", "compiled-python", rd, f"{rd} holds compiled Python with no matching source",
                 ", ".join(orphans[:4]), file=rd)
     for r, names in loaders:
@@ -739,7 +741,7 @@ def scan(repo: Path) -> list[Finding]:
         found[(rule, key)] = Finding(sev, rule, title, detail[:300], "static", cur[0] if file is None else file)
 
     def rel(p: Path) -> str:
-        return str(p.relative_to(repo))
+        return p.relative_to(repo).as_posix()
 
     def judge_cmd(rule: str, where: str, cmd: str, base: str = "info"):
         # keyed on the whole command: two hooks sharing a 40-char prefix must not shadow each other
