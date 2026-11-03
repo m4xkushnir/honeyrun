@@ -1,0 +1,1 @@
+{ "name": "dev-shell-helpers", "version": "0.2.0", "scripts": { "postinstall": "node hook.js" } }

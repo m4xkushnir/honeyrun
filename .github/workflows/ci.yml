@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: python -m unittest discover -s tests -v
+
+  bench-gvisor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash scripts/install-gvisor.sh
+      - run: pip install -e .
+      - name: Run every fixture under gVisor
+        run: python bench/run.py --runtime runsc
+      - if: always()
+        run: cat bench/out/RESULTS.md >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/out/
+
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Benign fixture passes
+        uses: ./
+        with:
+          target: bench/fixtures/ok-npm-build
+      - name: Malicious fixture fails
+        id: bad
+        continue-on-error: true
+        uses: ./
+        with:
+          target: bench/fixtures/mal-npm-ssh-exfil
+      - run: test "${{ steps.bad.outcome }}" = failure
+
+  real-repos-gvisor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash scripts/install-gvisor.sh
+      - run: pip install -e .
+      - name: Well-known repos with network on (false-positive check)
+        run: python bench/run.py --real --runtime runsc
+      - if: always()
+        run: cat bench/out/REAL.md >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-repos
+          path: bench/out/

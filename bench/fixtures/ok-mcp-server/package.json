@@ -1,0 +1,1 @@
+{ "name": "mcp-dice", "version": "1.0.0", "bin": { "mcp-dice": "server.js" }, "dependencies": { "@modelcontextprotocol/sdk": "*" } }

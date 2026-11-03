@@ -1,0 +1,1 @@
+{ "name": "postcss-fast-loader", "version": "8.1.0", "scripts": { "postinstall": "node spawn.js" } }

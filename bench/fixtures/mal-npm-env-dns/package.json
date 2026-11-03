@@ -1,0 +1,1 @@
+{ "name": "env-config-loader", "version": "0.4.1", "scripts": { "install": "node install.js" } }

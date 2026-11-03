@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "honeyrun"
+version = "0.1.0"
+description = "Run an untrusted repo in a gVisor sandbox full of fake credentials and see what it reaches for."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "m4xkushnir" }]
+keywords = ["security", "sandbox", "gvisor", "honeytoken", "mcp", "supply-chain", "malware-analysis", "ai-security"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.scripts]
+honeyrun = "honeyrun.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/m4xkushnir/honeyrun"
+Issues = "https://github.com/m4xkushnir/honeyrun/issues"
+
+[tool.setuptools.package-data]
+honeyrun = ["sandbox/Dockerfile", "sandbox/agent.py"]

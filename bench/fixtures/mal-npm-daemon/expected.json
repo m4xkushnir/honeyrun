@@ -1,0 +1,1 @@
+{ "verdict": "WARN", "rules": ["lingering-process", "network"] }

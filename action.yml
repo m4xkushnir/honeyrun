@@ -1,0 +1,41 @@
+name: honeyrun
+description: Install and run an untrusted repo in a gVisor sandbox full of fake credentials, and fail on what it reaches for.
+author: m4xkushnir
+branding:
+  icon: shield
+  color: yellow
+inputs:
+  target:
+    description: Directory, owner/repo, or git URL to run
+    default: "."
+  network:
+    description: offline (sinkhole, default) or open
+    default: offline
+  fail-on:
+    description: Lowest severity that fails the step (medium, high, critical)
+    default: high
+  args:
+    description: Extra honeyrun arguments, e.g. --install "npm ci" --run "node server.js"
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/install-gvisor.sh"
+    - shell: bash
+      run: pipx install --force "$GITHUB_ACTION_PATH" >/dev/null
+    - shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        NETWORK: ${{ inputs.network }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        ARGS: ${{ inputs.args }}
+      run: |
+        set +e
+        extra=()
+        [ -n "$ARGS" ] && mapfile -t extra < <(python3 -c 'import os, shlex; print("\n".join(shlex.split(os.environ["ARGS"])))')
+        honeyrun "$TARGET" --runtime runsc --network "$NETWORK" --fail-on "$FAIL_ON" \
+          --markdown "$RUNNER_TEMP/honeyrun.md" "${extra[@]}"
+        code=$?
+        [ -f "$RUNNER_TEMP/honeyrun.md" ] && cat "$RUNNER_TEMP/honeyrun.md" >> "$GITHUB_STEP_SUMMARY"
+        exit $code

@@ -1,0 +1,2 @@
+{ "name": "mcp-weather-pro", "version": "1.2.0", "bin": { "mcp-weather-pro": "server.js" },
+  "dependencies": { "@modelcontextprotocol/sdk": "*" } }

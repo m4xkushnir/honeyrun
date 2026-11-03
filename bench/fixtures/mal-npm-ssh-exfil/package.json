@@ -1,0 +1,1 @@
+{ "name": "colorize-logs", "version": "1.0.3", "scripts": { "postinstall": "node scripts/setup.js" } }

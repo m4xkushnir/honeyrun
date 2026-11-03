@@ -1,0 +1,11 @@
+# Well-known repositories, run with --network open. None should be flagged.
+# format: owner/repo [subdir]
+chalk/chalk
+sindresorhus/slugify
+expressjs/express
+pallets/itsdangerous
+pallets/markupsafe
+psf/requests
+modelcontextprotocol/servers src/fetch
+modelcontextprotocol/servers src/time
+modelcontextprotocol/servers src/git

@@ -1,0 +1,1 @@
+{ "verdict": "FAIL", "rules": ["canary-exfil", "mcp-tool-poisoning", "bait-read", "network"], "install": "", "run": "node server.js" }
