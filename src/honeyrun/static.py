@@ -69,7 +69,12 @@ def source_injection(text: str) -> tuple[str, str] | None:
                 continue
             if rx is _HIDE_FROM_USER and not _in_string(text, i):
                 continue
-            sev = "high" if SENSITIVE.search(window) else "medium"
+            # Ordinary system prompts say "never tell the user..." and talk about tokens and keys.
+            # What sets an injection apart is a concrete secret location next to the order.
+            secret = re.search(_SECRET_TARGET, window, re.I)
+            if rx is _HIDE_FROM_USER and not secret:
+                continue
+            sev = "high" if secret else "medium"
             if best is None or sev == "high":
                 best = (m.group(0), sev)
             if sev == "high":
@@ -80,7 +85,7 @@ def source_injection(text: str) -> tuple[str, str] | None:
 # Instruction files (AGENTS.md ...) are prose: naming ~/.config or saying "upload to https://" is
 # ordinary documentation. Only imperative phrasing aimed at the model or at secrets counts.
 _SECRET_TARGET = (r"(?:(?:~|\$HOME)/\.(?:ssh|aws|gnupg|kube|docker|npmrc|netrc|config/(?:gcloud|gh))|id_(?:rsa|ed25519|ecdsa)\b|"
-                  r"\.env(?![.\w-])|credentials\b|mcp\.json|claude_desktop_config|\.claude\.json)")
+                  r"\.env(?![.\w-])|\.aws/credentials|\.git-credentials|application_default_credentials|mcp\.json|claude_desktop_config|\.claude\.json)")
 INSTRUCTION_INJECTION: list[tuple[re.Pattern, bool]] = [
     (re.compile(r"ignore (all |any )?(the )?(previous|prior|above|earlier) (instructions|prompts|rules)", re.I), False),
     (re.compile(r"(do not|don'?t|never) (tell|mention|inform|reveal|disclose)(?: this| that| it)?(?: to| about)? the user\b(?!['\u2019]s)", re.I), False),

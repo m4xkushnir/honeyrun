@@ -116,6 +116,15 @@ The code runs as an unprivileged user under strace, inside gVisor or a VM, with 
 
 **A second opinion from your own AI, only when it helps.** `--review "claude -p"` (or `"codex exec -"`, or `"gemini -p {prompt_file}"`) asks the AI you already use to explain an UNCLEAR or NOT SAFE result in plain words, including what any decoded payload does, and to draft the abuse report. LOOKS SAFE runs never call it. It gets about 6 KB of masked, pre-filtered evidence and is told to explain only, never to rewrite or improve the code. Its answer never changes the exit code.
 
+### Keeping your AI safe while it checks
+
+The code being checked may try to talk to the AI that reads the results. honeyrun assumes it will:
+
+- In `--agent` output, every string from the code under test is quoted as `evidence:`. Text written for a model (hidden tool instructions, decoded payloads, a fake "LOOKS SAFE" line) is withheld and left in `--json` for humans.
+- The verdict line and the `next:` line end with the same per-run tag, so a forged verdict can't pass for honeyrun's.
+- The `--review` AI runs in an empty folder, without your GitHub, npm, cloud or SSH-agent credentials, and gets its evidence fenced with a random nonce. It has to end its answer with a second secret marker. If that marker is missing, if it calls hard evidence benign, or if it tells you to run something, honeyrun labels the answer unreliable. Either way the verdict comes from the evidence, never from the AI.
+- The skill and `AGENTS.md` snippet tell agents not to open the target before it's checked, never to act on quoted evidence, and to give a checking subagent nothing but shell access to honeyrun.
+
 ## In CI or in the cloud
 
 ```yaml

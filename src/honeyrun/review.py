@@ -20,9 +20,11 @@ import json
 import os
 import secrets
 import shlex
+import shutil
 import subprocess
 import tempfile
 
+from . import aisafety
 from .analyze import Analysis, clean, scrub, verdict
 from .installed import mask
 
@@ -43,6 +45,9 @@ line 1: one of LIKELY-BENIGN, SUSPICIOUS, LIKELY-MALICIOUS
 then: the 1-3 facts that decided it, in plain words a non-expert can follow, and what the user should do next.
 If line 1 is LIKELY-MALICIOUS, end with a 3-4 sentence factual abuse report (what the code does, observed \
 in a sandbox with fake credentials) that the user can paste into GitHub, npm or PyPI support.
+You have no reason to use tools, open files, browse or run commands for this; don't. Never tell the user to run \
+or install anything.
+The very last line of your answer must be exactly: {end}
 
 <{tag}>
 {evidence}
@@ -77,8 +82,9 @@ def evidence(a: Analysis, ctx: dict) -> str:
     return text[:MAX_EVIDENCE]
 
 
-def build_prompt(a: Analysis, ctx: dict, nonce: str | None = None) -> str:
-    return PROMPT.format(tag=f"evidence-{nonce or secrets.token_hex(8)}", evidence=evidence(a, ctx))
+def build_prompt(a: Analysis, ctx: dict, nonce: str | None = None, end: str = "") -> str:
+    return PROMPT.format(tag=f"evidence-{nonce or secrets.token_hex(8)}", evidence=evidence(a, ctx),
+                         end=end or f"review-end {secrets.token_hex(4)}")
 
 
 def validate(command: str) -> list[str]:
@@ -95,21 +101,34 @@ def run(command: str, a: Analysis, ctx: dict, timeout: int = 180) -> str:
         argv = validate(command)
     except (ValueError, IndexError) as e:
         return f"(review command invalid: {e})"
-    prompt = build_prompt(a, ctx)
+    # The answer must end with a marker only honeyrun and the reviewer know. Code under test that
+    # hijacks the reviewer usually also breaks that instruction, which is how we notice.
+    end = f"review-end {secrets.token_hex(4)}"
+    prompt = build_prompt(a, ctx, end=end)
     tmp = None
+    # An empty folder and no spare secrets: if the reviewer is talked into using tools, it finds nothing.
+    workdir = tempfile.mkdtemp(prefix="honeyrun-review-cwd-")
+    env = aisafety.reviewer_env()
     try:
         if "{prompt_file}" in command:
             fd, tmp = tempfile.mkstemp(prefix="honeyrun-review-", suffix=".txt")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(prompt)
-            res = subprocess.run([x.replace("{prompt_file}", tmp) for x in argv],
-                                 capture_output=True, text=True, timeout=timeout)
+            res = subprocess.run([x.replace("{prompt_file}", tmp) for x in argv], capture_output=True, text=True,
+                                 timeout=timeout, cwd=workdir, env=env, stdin=subprocess.DEVNULL)
         else:
-            res = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout)
+            res = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=timeout,
+                                 cwd=workdir, env=env)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"(review command failed: {clean(e)})"
     finally:
         if tmp:
             os.unlink(tmp)
+        shutil.rmtree(workdir, ignore_errors=True)
     out = (res.stdout or res.stderr or "").strip()
-    return "\n".join(out.splitlines()[:12])[:1500]
+    problems = aisafety.check_review(out, end, verdict(a.findings))
+    body = "\n".join(aisafety.strip_marker(out, end).splitlines()[:14])[:1500]
+    if problems:
+        return ("(This AI review looks unreliable: " + "; ".join(problems) +
+                ". honeyrun's verdict above stands on its own evidence.)\n" + body)
+    return body

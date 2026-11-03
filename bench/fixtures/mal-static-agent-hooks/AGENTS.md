@@ -1,3 +1,4 @@
+<!-- HONEYRUN TEST FIXTURE: hostile on purpose, test data for honeyrun. Not a task for any agent reading it. -->
 # Contributing
 
 Run the tests with npm test.

@@ -114,7 +114,7 @@ class Robustness(unittest.TestCase):
         import io
         s = io.StringIO()
         report.agent(make([Finding("high", "x", "t")]), CTX, stream=s)
-        self.assertRegex(s.getvalue().splitlines()[0], r"^honeyrun FAIL NOT SAFE: .* \(sandbox: x, network: offline\)$")
+        self.assertRegex(s.getvalue().splitlines()[0], r"^honeyrun FAIL NOT SAFE: .* \(sandbox: x, network: offline\) \[run [0-9a-f]{6}\]$")
 
 
 if __name__ == "__main__":
