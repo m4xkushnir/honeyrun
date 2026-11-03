@@ -11,7 +11,7 @@ honeyrun is released under the MIT License and provided "as is", without warrant
 - **No telemetry.** honeyrun has no analytics, no accounts and no server of its own. It never phones home.
 - **Network use you can see.** It only goes online to:
   - download what you asked it to check (git clone, npm or PyPI download);
-  - look the target up in [OSV](https://osv.dev) and the GitHub API, on by default for public targets and off for local directories. Turn it off with `--no-intel`;
+  - look the target up in [OSV](https://osv.dev) and the GitHub API, on by default only for `npm:`, `pypi:` and plain `https://` GitHub or GitLab targets (and `owner/repo`), off for local paths, ssh/scp URLs, other hosts and anything with credentials in the URL (`--intel` forces it on). Your `GITHUB_TOKEN`, if set, is sent only to api.github.com, and only for github.com targets. Turn it off with `--no-intel`;
   - send a review prompt with `--review`, and only to the command you name.
 - **Inside the sandbox** the code under test sees fake credentials only. Your real home directory, keys and environment are never mounted or copied in. Local directories are packed without `.git` and without untracked secret-looking files (`.env`, keys, `.npmrc`, `.netrc`, ...).
 - **On your machine,** `--agent-configs` and `--installed` read local files and print names, commands and findings. They mask tokens, passwords in URLs and secret-looking values, never print environment values, and write `~` instead of your home path.

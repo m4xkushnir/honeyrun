@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -135,8 +136,11 @@ def ensure_image(quiet: bool = False, engine: str = "docker") -> str:
 
 
 # Files that hold real credentials: never shipped unless git tracks them (then they are the repo).
-SECRET_NAMES = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".npmrc", ".pypirc", ".netrc",
-                "credentials.json")
+SECRET_NAMES = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", ".npmrc",
+                ".pypirc", ".netrc", "credentials.json", "*.p12", "*.pfx", "*.jks", "*.keystore", ".git-credentials",
+                ".htpasswd", ".dockercfg", "kubeconfig", "*.tfvars", "terraform.tfstate*", "service-account*.json")
+SECRET_DIRS = {".ssh", ".gnupg"}                                   # everything below these
+SECRET_IN_DIR = {".aws": ("credentials", "config"), ".docker": ("config.json",)}
 GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
 GIT_HARDEN = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
 MAX_TRACE = 1536 * 1024 * 1024    # container stdout, on disk
@@ -145,6 +149,8 @@ MAX_MEMBER = 512 * 1024 * 1024    # one trace file, in memory
 
 def _is_secret(rel: str) -> bool:
     parts = rel.split("/")
+    if SECRET_DIRS & set(parts[:-1]) or (len(parts) > 1 and parts[-1] in SECRET_IN_DIR.get(parts[-2], ())):
+        return True
     return "secrets" in parts[:-1] or any(fnmatch.fnmatch(parts[-1], pat) for pat in SECRET_NAMES)
 
 
@@ -170,9 +176,17 @@ def _walk_files(src: Path) -> list[str]:
     return out
 
 
+def _inside(root: str, p: str) -> bool:
+    return (p + os.sep).startswith(root + os.sep)
+
+
 def _add(tf: tarfile.TarFile, src: Path, root: str, rel: str) -> None:
     path = src / rel
-    if os.path.islink(path) and not (os.path.realpath(path) + os.sep).startswith(root + os.sep):
+    # A symlinked parent directory (d -> ~/.ssh) would make d/id_rsa a read from outside the tree.
+    if not _inside(root, os.path.realpath(path.parent)):
+        return
+    is_link = os.path.islink(path)
+    if is_link and not _inside(root, os.path.realpath(path)):
         return   # points outside the source tree
     try:
         tf.inodes.clear()   # hard links must travel as plain files: the agent drops link members
@@ -180,7 +194,8 @@ def _add(tf: tarfile.TarFile, src: Path, root: str, rel: str) -> None:
         if info.isdev() or info.isdir():   # gitlinks and sockets
             return
         if info.isreg():
-            with open(path, "rb") as f:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as f:
                 tf.addfile(info, f)
         else:
             tf.addfile(info)
@@ -217,7 +232,7 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
     name = f"honeyrun-{uuid.uuid4().hex[:10]}"
     tmp = Path(tempfile.mkdtemp(prefix="honeyrun-"))
     if runtime.engine == "container":
-        return _run_apple(src, job, runtime, image, timeout, memory, cpus, name)
+        return _run_apple(src, job, runtime, image, timeout, memory, cpus, name, tmp)
     args = [
         "run", "--rm", "-i", "--name", name,
         *(["--runtime", runtime.name] if runtime.name else []),
@@ -250,10 +265,9 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
     return _execute(runtime.engine, args, name, job, src, timeout, tmp)
 
 
-def _run_apple(src, job, runtime, image, timeout, memory, cpus, name) -> dict[str, bytes]:
+def _run_apple(src, job, runtime, image, timeout, memory, cpus, name, tmp: Path) -> dict[str, bytes]:
     """Apple container: every sandbox is its own VM, so the VM is the boundary and the
     container-level knobs Docker needs (pids, seccomp, tmpfs sizes) do not exist there."""
-    tmp = Path(tempfile.mkdtemp(prefix="honeyrun-"))
     args = ["run", "--rm", "-i", "--name", name, "--memory", memory, "--cpus", cpus, "--read-only",
             "--cap-drop", "ALL",
             "--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "DAC_READ_SEARCH",
@@ -329,20 +343,42 @@ def _run_container(engine, args, name, payload, out_f, err_f, timeout) -> None:
         time.sleep(0.2)
 
 
+MAX_TRACE_TOTAL = 600 * 1024 * 1024    # all trace members together, in memory
+MAX_TRACE_MEMBERS = 2000
+_TRACE_NAME = re.compile(r"^(.+\.strace|.+\.log|.+\.mcp\.jsonl|net\.jsonl|meta\.json|files\.json)$")
+
+
 def _read_trace(path: str) -> dict[str, bytes]:
+    """The agent's tar, read defensively: the workload can write into /trace, so names and sizes are untrusted."""
     out: dict[str, bytes] = {}
     cut: list[str] = []
+    total = seen = 0
     try:
         with tarfile.open(path, mode="r:gz") as tf:
             for member in tf:
+                seen += 1
+                if seen > MAX_TRACE_MEMBERS:
+                    cut.append("too-many-members")
+                    break
                 if not member.isfile():
+                    continue
+                key = os.path.basename(member.name)
+                if not _TRACE_NAME.match(key):
+                    cut.append(f"ignored:{key[:60]}")
+                    continue
+                if key in out:
+                    cut.append(f"duplicate:{key}")   # first one wins: a later copy could overwrite meta.json
                     continue
                 f = tf.extractfile(member)
                 if not f:
                     continue
-                key = os.path.basename(member.name)
-                out[key] = f.read(MAX_MEMBER)
-                if member.size > MAX_MEMBER:
+                room = min(MAX_MEMBER, MAX_TRACE_TOTAL - total)
+                if room <= 0:
+                    cut.append(f"budget:{key}")
+                    break
+                out[key] = f.read(room)
+                total += len(out[key])
+                if member.size > len(out[key]):
                     cut.append(key)
     except (tarfile.TarError, EOFError, OSError) as e:
         if not out:

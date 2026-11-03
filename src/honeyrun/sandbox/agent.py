@@ -32,13 +32,18 @@ META = "/trace-meta"          # net.jsonl, meta.json, files.json: survives a ful
 CA_DIR = f"{META}/ca"         # CA key lives here; never tarred out
 PUB = "/run/honeyrun"         # root-owned, world-readable: the CA bundle the workload trusts
 MAX_CONN = 64
-NET_LOG_CAP = 8 * 1024 * 1024
+DNS_LOG_CAP = 2 * 1024 * 1024    # separate budgets: a TCP flood must not hide DNS tunnelling, nor the reverse
+TCP_LOG_CAP = 6 * 1024 * 1024
+PAYLOAD_CAP = 32 * 1024           # stored bytes per TCP record; "bytes" keeps the true size
+RING = 200                        # most recent TCP records, written at the end even past the cap
 TRACE_FULL = 0.90
+LINGER_WINDOW = 20          # seconds to keep watching what the command left running (or until the phase deadline)
 HOME = "/home/runner"
 WORK = "/workspace/repo"
 SYSCALLS = (
     "execve,execveat,clone,clone3,fork,vfork,open,openat,openat2,creat,"
-    "connect,sendto,sendmsg,sendmmsg,bind,listen,"
+    "connect,sendto,sendmsg,sendmmsg,bind,listen,chdir,fchdir,"
+    "io_uring_setup,io_uring_enter,io_uring_register,"
     "memfd_create,socket,ptrace,unshare,setns,mount,init_module,finit_module"
 )
 # Paths that change on every install and say nothing about the code: counted, not listed.
@@ -57,25 +62,62 @@ def log(msg):
 DEGRADED = threading.Event()   # the sinkhole lost evidence or dropped connections
 
 
+def cap_payload(rec):
+    """Keep the head and tail of a large payload: a flood of junk must not push the secret out,
+    and the agent cannot know which bytes are the secret."""
+    raw = rec.pop("_raw", None)
+    if raw is None:
+        return
+    rec["bytes"] = rec.get("bytes", len(raw))
+    if len(raw) > PAYLOAD_CAP:
+        half = PAYLOAD_CAP // 2
+        raw = raw[:half] + raw[-half:]
+        rec["truncated"] = True
+    rec["data_b64"] = base64.b64encode(raw).decode()
+
+
 class NetLog:
     def __init__(self, path):
         self.f = open(path, "a")
         self.lock = threading.Lock()
-        self.size = 0
+        self.used = {"dns": 0, "tcp": 0}
+        self.caps = {"dns": DNS_LOG_CAP, "tcp": TCP_LOG_CAP}
+        self.ring = []          # (seq, line) of the latest TCP records
+        self.seq = 0
+        self.written = set()
 
     def write(self, **rec):
         rec["t"] = round(time.time(), 3)
+        bucket = "dns" if rec.get("kind") == "dns" else "tcp"
         try:
+            cap_payload(rec)
             line = json.dumps(rec) + "\n"
             with self.lock:
-                if self.size + len(line) > NET_LOG_CAP:
+                self.seq += 1
+                seq = self.seq
+                if bucket == "tcp":
+                    self.ring.append((seq, line))
+                    del self.ring[:-RING]
+                if self.used[bucket] + len(line) > self.caps[bucket]:
                     DEGRADED.set()
                     return
                 self.f.write(line)
                 self.f.flush()
-                self.size += len(line)
+                self.used[bucket] += len(line)
+                self.written.add(seq)
         except (OSError, ValueError):
             DEGRADED.set()   # full disk must not kill the sinkhole thread
+
+    def close(self):
+        """Append the latest TCP records that the budget dropped (a flood followed by the real exfil)."""
+        with self.lock:
+            try:
+                for seq, line in self.ring:
+                    if seq not in self.written:
+                        self.f.write(line)
+            except OSError:
+                DEGRADED.set()
+            self.f.close()
 
 
 # ---------------------------------------------------------------- sinkhole
@@ -173,7 +215,7 @@ def read_request(conn):
 
 
 def http_fields(data):
-    rec = {"bytes": len(data), "data_b64": base64.b64encode(data[:262144]).decode()}
+    rec = {"bytes": len(data), "_raw": data}
     parts = data.split(b"\r\n", 1)[0].decode("latin-1", "replace").split(" ")
     if len(parts) >= 2:
         rec["method"], rec["path"] = parts[0], parts[1]
@@ -265,8 +307,7 @@ def handle_tls(conn, netlog, mint):
         except Exception:
             secure = None   # pinned client rejected our CA, or minting failed
     if secure is None:
-        rec = {"kind": "tcp", "port": 443, "bytes": len(hello),
-               "data_b64": base64.b64encode(hello).decode(), "sni": sni}
+        rec = {"kind": "tcp", "port": 443, "bytes": len(hello), "_raw": hello, "sni": sni}
         netlog.write(**rec)
         return
     try:
@@ -581,8 +622,10 @@ def run_phase(phase, env, uid):
         if main_done_at is None and main.poll():
             main_done_at = now
         if main_done_at is not None and now - main_done_at > 5 and not lingering:
-            # The command itself finished but something it started is still alive.
+            # The command itself finished but something it started is still alive. Note it now but
+            # keep tracing: `sleep 8; curl ...` should still be seen before it is killed.
             lingering = [describe(p) for p in runner_pids(uid)]
+        if main_done_at is not None and now - main_done_at > LINGER_WINDOW:
             kill_runner(uid)
         if now > deadline:
             timed_out = not truncated
@@ -723,12 +766,18 @@ def extract_repo(stream, uid, gid):
             if unsafe_member(member.name) or member.isdev() or member.islnk():
                 continue
             name = os.path.normpath(member.name)
+            target = os.path.join(WORK, name)
+            # Running as root: extracting over a symlink member planted earlier would write through it,
+            # and chmod follows links. Drop a pre-existing link first; never touch through one.
+            if os.path.islink(target):
+                os.unlink(target)
             # An earlier symlink member must not redirect a later one out of the repo.
-            if not (os.path.realpath(os.path.join(WORK, os.path.dirname(name))) + "/").startswith(root + "/"):
+            parent = os.path.realpath(os.path.dirname(target))
+            if not (parent + "/").startswith(root + "/"):
                 continue
             tf.extract(member, WORK, set_attrs=False)
-            if not member.issym():
-                os.chmod(os.path.join(WORK, name), 0o755 if member.isdir() or member.mode & 0o111 else 0o644)
+            if not member.issym() and not os.path.islink(target):
+                os.chmod(target, 0o755 if member.isdir() or member.mode & 0o111 else 0o644)
     chown_tree("/workspace", uid, gid)
 
 
@@ -788,9 +837,8 @@ def main():
         json.dump(diff(before, snapshot()), f)
 
     with open(f"{META}/meta.json", "w") as f:
-        json.dump({"phases": results, "network": job.get("network"), "sinkhole_degraded": DEGRADED.is_set()}, f)
-    with netlog.lock:
-        netlog.f.close()
+        json.dump({"phases": results, "phases_requested": len(job.get("phases", [])), "network": job.get("network"), "sinkhole_degraded": DEGRADED.is_set()}, f)
+    netlog.close()
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as tf:
         tf.add(TRACE, arcname="trace")
         for n in os.listdir(META):

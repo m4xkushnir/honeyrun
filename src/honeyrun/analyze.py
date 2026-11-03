@@ -17,6 +17,7 @@ HOME = "/home/runner"
 PROBE_HOST = "honeyrun.example.net"
 SEARCH_SUFFIXES = (".internal.cloudapp.net", ".internal", ".local", ".lan", ".home.arpa")
 WORK = "/workspace"
+REPO = WORK + "/repo"
 SEVERITIES = ("info", "medium", "high", "critical")
 
 # package registries and code hosts an install is expected to talk to
@@ -25,7 +26,8 @@ EXPECTED_HOSTS = (
     "pypi.org", "files.pythonhosted.org", "pypi.python.org", "pypi.io",
     "github.com", "codeload.github.com", "objects.githubusercontent.com", "raw.githubusercontent.com",
     "api.github.com", "release-assets.githubusercontent.com", "github-releases.githubusercontent.com",
-    # browser, engine and model downloads that setup scripts legitimately fetch
+    # browser, engine and model downloads that setup scripts legitimately fetch (some also accept
+    # uploads: a request with a body to any host here is still flagged as "upload")
     "cdn.playwright.dev", "playwright.azureedge.net", "playwright.download.prss.microsoft.com",
     "binaries.prisma.sh", "storage.googleapis.com", "cdn.jsdelivr.net", "unpkg.com",
     "huggingface.co", "cdn-lfs.huggingface.co", "electronjs.org",
@@ -273,6 +275,8 @@ def parse_strace_counted(raw: str, phase: str) -> tuple[list[Event], int]:
     pending: dict[int, tuple[str, str]] = {}
     events: list[Event] = []
     first_pid = None
+    # the workload starts in the repo; chdir/fchdir move a process, fork copies it to the child
+    cwds: dict[int, str] = {}
 
     def proc(pid: int) -> Proc:
         if pid not in procs:
@@ -306,6 +310,19 @@ def parse_strace_counted(raw: str, phase: str) -> tuple[list[Event], int]:
             child = int(ret)
             spawned += "CLONE_THREAD" not in args
             procs[child] = Proc(child, p.exe, list(p.argv), pid)
+            cwds[child] = cwds.get(pid, REPO)
+        elif name in ("chdir", "fchdir") and ok:
+            if name == "fchdir":
+                d = DIRFD.match(args)
+                new = unescape(d.group(1)) if d else ""
+            else:
+                new = text(strings[0]) if strings else ""
+                if new and not new.startswith("/"):
+                    new = posixpath.join(cwds.get(pid, REPO), new)
+            if new.startswith("/"):
+                cwds[pid] = norm(new)
+        elif name == "io_uring_setup":
+            events.append(Event(phase, "iouring", pid, p, {"ok": ok}))
         elif name in ("execve", "execveat") and strings:
             path = text(strings[0])
             if path.startswith("/"):
@@ -319,9 +336,10 @@ def parse_strace_counted(raw: str, phase: str) -> tuple[list[Event], int]:
             if not path.startswith("/"):
                 # relative to whichever directory fd the call names (AT_FDCWD or an fd decorated by -yy)
                 base = DIRFD.match(args) if name in ("openat", "openat2") else None
-                cwd = unescape(base.group(1)) if base else WORK
+                # strace's own decoration wins; otherwise the cwd we tracked for this pid
+                cwd = unescape(base.group(1)) if base else cwds.get(pid, REPO)
                 if not cwd.startswith("/"):
-                    cwd = WORK
+                    cwd = cwds.get(pid, REPO)
                 path = posixpath.join(cwd, path)
             path = norm(path)
             write = name == "creat" or bool(re.search(r"O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND", args))
@@ -371,7 +389,7 @@ OWN_SERVICE = {
 
 
 def _own_service(label: str, where: str) -> bool:
-    m = re.match(r"^[A-Z]+ https?://([^/:\s]+)", where)
+    m = re.match(r"^[A-Z]+ https://([^/:\s]+)", where)
     host = (m.group(1) if m else "").lower()
     return any(host == h or host.endswith("." + h) for h in OWN_SERVICE.get(label, ()))
 
@@ -384,6 +402,23 @@ def host_expected(host: str) -> bool:
     if host.startswith(PROBE_HOST + ".") and host.endswith(SEARCH_SUFFIXES):
         return True
     return any(host == h or host.endswith("." + h) for h in EXPECTED_HOSTS)
+
+
+TEST_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+
+
+def is_public_ip(addr: str) -> bool:
+    """A routable address (documentation ranges count: honeyrun's own fixtures use them)."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.version == 4 and any(ip in n for n in TEST_NETS):
+        return True
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast
+                or ip.is_reserved)
 
 
 def is_remote_ip(addr: str) -> bool:
@@ -410,8 +445,18 @@ class Analysis:
 
 
 def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysis:
-    meta = json.loads(trace.get("meta.json", b"{}") or b"{}")
+    try:
+        meta = json.loads(trace.get("meta.json", b"{}") or b"{}")
+    except ValueError:
+        meta = None
+    if not isinstance(meta, dict):
+        meta = {}
+        meta_bad = True
+    else:
+        meta_bad = False
     phases = meta.get("phases", [])
+    if not isinstance(phases, list):
+        phases = []
     events: list[Event] = []
     spawned: dict[str, int] = {}
     for ph in phases:
@@ -553,7 +598,13 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             add("medium", "privilege", base, f"tries to run {base}", joined[:160], ev.phase)
 
     for ev in events:
-        if ev.kind == "memfd":
+        if ev.kind == "iouring":
+            # Node's libuv opens a ring on its own and JavaScript cannot drive one directly, so a
+            # node process is noted only; anything else (python/ctypes, native code) is a real bypass.
+            sev = "info" if ev.proc.name in ("node", "nodejs") else "medium"
+            add(sev, "io-uring", "io_uring", "uses io_uring (can do I/O that strace cannot see)",
+                f"by {ev.proc.label()}", ev.phase)
+        elif ev.kind == "memfd":
             add("medium", "fileless-exec", "memfd", "creates an anonymous in-memory file (memfd_create)",
                 f"{ev.data['name']} by {ev.proc.label()}", ev.phase)
         elif ev.kind == "kernel":
@@ -581,8 +632,10 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         if proc and not h["by"]:
             h["by"] = proc.label(60)
 
+    dns_phases: set[str] = set()    # events arrive in order, so this is "a lookup came earlier in the phase"
     for ev in events:
         if ev.kind == "dns":
+            dns_phases.add(ev.phase)
             note_host(ev.data["qname"].lower().rstrip("."), ev.phase, "dns", ev.proc)
         elif ev.kind == "connect":
             d = ev.data
@@ -599,8 +652,14 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                     f"{d['addr']}:{d['port']} by {ev.proc.label()}", ev.phase)
             elif d["family"] != "unix" and d["port"] != 53 and is_remote_ip(d["addr"]) and network == "offline":
                 note_host(f"{d['addr']}:{d['port']}", ev.phase, "direct-ip", ev.proc)
+            elif d["family"] != "unix" and d["port"] != 53 and network == "open" and is_public_ip(d["addr"]):
+                # Open mode resolves for real, and we cannot map an address back to a name. A connect
+                # with no lookup before it in the phase was certainly hard-coded; after lookups it is probably resolved.
+                note_host(f"{d['addr']}:{d['port']}", ev.phase,
+                          "ip-after-dns" if ev.phase in dns_phases else "direct-ip", ev.proc)
 
     egress: list[tuple[str, bytes, str]] = []   # (where, payload, phase)
+    uploads: dict[str, tuple[str, str]] = {}
     for line in trace.get("net.jsonl", b"").decode("utf-8", "replace").splitlines():
         try:
             rec = json.loads(line)
@@ -610,15 +669,31 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             note_host(rec["qname"].lower().rstrip("."), phase_at(rec.get("t")), "dns")
         elif rec.get("kind") == "tcp":
             payload = base64.b64decode(rec.get("data_b64", ""))
-            host = rec.get("host") or rec.get("sni") or f"127.0.0.1:{rec['port']}"
-            host = host.split(":")[0] if rec.get("host") else host
-            proto = "https" if rec.get("sni") is not None or payload[:1] == b"\x16" else "http"
-            where = (f"{rec.get('method', '')} {proto}://{host}{rec.get('path', '')}".strip()
-                     if rec.get("method") or proto == "http" else f"TLS to {host} (handshake refused, body not seen)")
+            sni = rec.get("sni") if isinstance(rec.get("sni"), str) and rec.get("sni") else None
+            is_tls = rec.get("sni") is not None or bool(rec.get("tls")) or payload[:1] == b"\x16"
+            hdr = (rec.get("host") or "").split(":")[0].lower() or None
+            # Over TLS the destination is the SNI: the Host header is inside the encrypted body and
+            # the client controls it. Over plain HTTP anyone can claim any Host.
+            host = (sni or hdr or f"127.0.0.1:{rec['port']}") if is_tls else (hdr or f"127.0.0.1:{rec['port']}")
+            host = host.lower()
             rec_phase = phase_at(rec.get("t"))
-            note_host(host.lower(), rec_phase, proto)
-            hosts[host.lower()]["requests"] = hosts[host.lower()].get("requests", []) + [where]
+            # only a TLS request whose SNI exists can count as "sent to that service"
+            scheme = "https" if sni else "https-nosni" if is_tls else "http"
+            where = (f"{rec.get('method', '')} {scheme}://{host}{rec.get('path', '')}".strip()
+                     if rec.get("method") or not is_tls else f"TLS to {host} (handshake refused, body not seen)")
+            if is_tls and sni and hdr and hdr != sni.lower():
+                add("high", "host-mismatch", f"{sni}|{hdr}", f"TLS to {sni} but Host header says {hdr} (domain fronting or spoofed Host)",
+                    where, rec_phase if rec_phase != "?" else "")
+            note_host(host, rec_phase, "https" if is_tls else "http")
+            hosts[host]["requests"] = hosts[host].get("requests", []) + [where]
+            head, sep, body = payload.partition(b"\r\n\r\n")
+            declared = max(rec.get("bytes", 0) - len(head) - 4, 0) if sep else 0
+            if rec.get("method") and (rec["method"].upper() in ("POST", "PUT", "PATCH") or max(len(body), declared) > 2048):
+                uploads.setdefault(host, (where, "" if rec_phase == "?" else rec_phase))
             egress.append((where, payload, "" if rec_phase == "?" else rec_phase))
+
+    for host, (where, ph) in uploads.items():
+        add("medium", "upload", host, f"uploads data to {host}", where, ph)
 
     for ph_name, n in spawned.items():
         if n > FORK_BOMB:
@@ -710,16 +785,24 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         h["expected"] = host_expected(name)
         if h["expected"]:
             continue
+        if set(h["how"]) == {"ip-after-dns"}:
+            add("info", "network", name, f"connects to {name} (address from an earlier lookup)", f"by {h['by']}" if h["by"] else "",
+                ",".join(h["phases"]))
+            continue
         sev = "medium"
         what = "connects to a hard-coded IP" if "direct-ip" in h["how"] else "contacts"
         add(sev, "network", name, f"{what} {name}",
             "; ".join(h.get("requests", [])[:2]) or (f"by {h['by']}" if h["by"] else ""), ",".join(h["phases"]))
 
     # -------------------------------------------------- lingering processes
-    for ph in phases:
-        if ph["name"] == "install" and ph.get("lingering"):
-            cmds = ", ".join(p["cmdline"][:60] for p in ph["lingering"][:3])
-            add("medium", "lingering-process", ph["name"], "leaves a process running after install", cmds, ph["name"])
+    # Every phase, not only install: a delayed `sleep 8; curl ...` or a daemon started by `run` is the same
+    # behaviour. MCP phases are servers by design and excluded.
+    linger = [ph for ph in phases if ph.get("lingering") and not ph.get("mcp")]
+    if linger:
+        cmds = ", ".join(p.get("cmdline", "")[:60] for p in linger[0]["lingering"][:3])
+        names = ",".join(ph["name"] for ph in linger)
+        after = "install" if names == "install" else "the command finished"
+        add("medium", "lingering-process", "linger", f"leaves a process running after {after}", cmds, names)
 
     # -------------------------------------------------- MCP tools
     tools: list[dict] = []
@@ -780,7 +863,15 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         add("high", "incomplete", "host-truncated", "evidence truncated: the trace was too large to read in full",
             (trace.get("_truncated") or trace.get("_incomplete") or b"").decode("utf-8", "replace")[:120])
     if meta.get("sinkhole_degraded"):
-        add("medium", "incomplete", "sinkhole", "the network sinkhole degraded during the run: some traffic may not have been recorded")
+        if any(not h["expected"] for h in hosts.values()):
+            add("high", "incomplete", "sinkhole", "the network sinkhole lost traffic while the code contacted unexpected hosts: "
+                "the record of what it sent is incomplete")
+        else:
+            add("medium", "incomplete", "sinkhole", "the network sinkhole degraded during the run: some traffic may not have been recorded")
+    # A trace with content but no usable phase list must not read as a clean run. analyze({}) is the static-only case.
+    # (the agent says how many phases it was asked to run, so a repo with nothing to run is not an error)
+    if trace and (meta_bad or (not phases and meta.get("phases_requested", 1) > 0)):
+        add("high", "incomplete", "no-meta", "incomplete: the sandbox returned no usable record of the run")
 
     # -------------------------------------------------- filesystem changes (before/after snapshot)
     files = json.loads(trace.get("files.json", b"{}") or b"{}")

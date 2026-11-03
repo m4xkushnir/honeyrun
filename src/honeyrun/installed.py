@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import deobf
 from .analyze import Finding
+from .safeio import safe_read
 from .static import ACTS, DATE_GATE, HOT, LIFECYCLE, LONG_TIMER, WARM, _typosquat, safe_rel, source_injection
 
 # prefixed tokens: keep the 4-char prefix so the report still says what kind of secret it was
@@ -79,10 +80,7 @@ def _grade(cmd: str) -> str:
 
 
 def _read(p: Path, limit: int = 1_000_000) -> str:
-    try:
-        return p.read_text(encoding="utf-8", errors="replace")[:limit]
-    except OSError:
-        return ""
+    return (safe_read(p, limit) or "")
 
 
 def _json(p: Path):

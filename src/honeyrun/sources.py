@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shutil
 import tarfile
 import tempfile
 import urllib.parse
@@ -63,6 +64,26 @@ def _safe_name(name: str) -> str | None:
 
 
 def unpack(data: bytes, dest: Path, strip_top: bool = False) -> None:
+    """Unpack a tar or zip; any malformed or conflicting archive becomes a SandboxError."""
+    try:
+        _unpack(data, dest, strip_top)
+    except (OSError, tarfile.TarError, zipfile.BadZipFile, EOFError, ValueError) as e:
+        raise SandboxError(f"archive could not be unpacked: {type(e).__name__}")
+
+
+def _blocked(dest: Path, target: Path) -> bool:
+    """True when the name collides with another member: a parent that is a file, or a directory in the way."""
+    if target.is_dir():
+        return True
+    p = target.parent
+    while p != dest and dest in p.parents:
+        if p.exists() and not p.is_dir():
+            return True
+        p = p.parent
+    return False
+
+
+def _unpack(data: bytes, dest: Path, strip_top: bool = False) -> None:
     """Unpack a tar or zip held in memory: regular files and directories only, within limits."""
     total, count = 0, 0
 
@@ -82,6 +103,8 @@ def unpack(data: bytes, dest: Path, strip_top: bool = False) -> None:
                 target = place(info.filename)
                 if target is None or info.is_dir() or (info.external_attr >> 16) & 0o170000 == 0o120000:
                     continue    # skip directories (made on demand) and symlinks
+                if _blocked(dest, target):
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(info) as src, open(target, "wb") as out:
                     out.write(src.read(MAX_UNPACKED))
@@ -105,6 +128,8 @@ def unpack(data: bytes, dest: Path, strip_top: bool = False) -> None:
                 continue
             f = tf.extractfile(m)
             if f is None:
+                continue
+            if _blocked(dest, target):
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with open(target, "wb") as out:
@@ -154,7 +179,11 @@ def fetch_package(target: str) -> tuple[Path, str, Path, dict]:
     dest = tmp / "pkg"
     dest.mkdir()
     is_wheel = ecosystem == "PyPI" and zipfile.is_zipfile(io.BytesIO(data))
-    unpack(data, dest, strip_top=not is_wheel)
+    try:
+        unpack(data, dest, strip_top=not is_wheel)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return dest, f"{kind}:{name}@{version}", tmp, {"ecosystem": ecosystem, "name": name, "version": version}
 
 
@@ -162,10 +191,14 @@ def fetch_archive(path: Path) -> tuple[Path, str, Path]:
     tmp = Path(tempfile.mkdtemp(prefix="honeyrun-archive-"))
     dest = tmp / "pkg"
     dest.mkdir()
-    data = path.read_bytes() if path.stat().st_size <= MAX_DOWNLOAD else b""
-    if not data:
-        raise SandboxError("archive larger than 200 MB")
-    unpack(data, dest)
+    try:
+        data = path.read_bytes() if path.stat().st_size <= MAX_DOWNLOAD else b""
+        if not data:
+            raise SandboxError("archive larger than 200 MB or empty")
+        unpack(data, dest)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     # npm tarballs and most sdists wrap everything in one top directory: run from inside it
     entries = [p for p in dest.iterdir()]
     if len(entries) == 1 and entries[0].is_dir():

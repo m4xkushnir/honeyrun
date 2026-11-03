@@ -8,6 +8,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .safeio import safe_read
+
 MCP_NODE_DEPS = {"@modelcontextprotocol/sdk", "fastmcp", "mcp-framework"}
 MCP_PY_DEPS = re.compile(r"^\s*['\"]?(mcp|fastmcp)\b", re.I)
 CI_ENV = {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_WORKFLOW": "build", "RUNNER_OS": "Linux"}
@@ -37,8 +39,8 @@ def _exists(repo: Path, rel: object) -> bool:
 
 def _node(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | None]:
     try:
-        pkg = json.loads((repo / "package.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        pkg = json.loads(safe_read(repo / "package.json") or "{}")
+    except (ValueError, RecursionError):
         pkg = {}
     if not isinstance(pkg, dict):
         pkg = {}
@@ -77,7 +79,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
     pyproject = repo / "pyproject.toml"
     if pyproject.exists():
         try:
-            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            data = tomllib.loads(safe_read(pyproject) or "")
             project = data.get("project") if isinstance(data, dict) else None
             project = project if isinstance(project, dict) else {}
             if isinstance(project.get("dependencies"), list):
@@ -89,7 +91,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
     req = repo / "requirements.txt"
     if req.exists():
         try:
-            deps += req.read_text(encoding="utf-8", errors="replace").splitlines()
+            deps += (safe_read(req) or "").splitlines()
         except OSError:
             pass
     plan.mcp = any(MCP_PY_DEPS.match(d) for d in deps)

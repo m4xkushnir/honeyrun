@@ -8,11 +8,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
 from . import __version__, bait, detect, history, installed, intel, report, review, sources, static
 from .analyze import SEVERITIES, Finding, analyze, scrub
+from .safeio import safe_read
 from .sandbox import SandboxError, ensure_image, pick_runtime, run_job
 
 GIT_URL = re.compile(r"^(https?://|git@|ssh://)|^[\w.-]+/[\w.-]+$")
@@ -49,7 +51,11 @@ def fetch(target: str, ref: str | None) -> tuple[Path, str, Path | None]:
         cmd += ["--branch", ref]
     cmd += ["--", url, str(dest / "repo")]
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
-    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    except OSError as e:     # git is not installed
+        shutil.rmtree(dest, ignore_errors=True)
+        raise SandboxError(f"git is required to clone {url_label(url)}: {e.strerror or type(e).__name__}")
     if res.returncode != 0:
         shutil.rmtree(dest, ignore_errors=True)
         # git echoes the URL back on failure: never let its credentials through.
@@ -57,6 +63,29 @@ def fetch(target: str, ref: str | None) -> tuple[Path, str, Path | None]:
     head = subprocess.run(["git", "-C", str(dest / "repo"), "rev-parse", "--short", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     return dest / "repo", url_label(url, head), dest
+
+
+PUBLIC_HOSTS = ("github.com", "gitlab.com")
+
+
+def default_intel(target: str, is_package: bool = False, is_local: bool = False) -> bool:
+    """Whether looking the target up on OSV/GitHub is on by default: only for plainly public ones.
+
+    Registry specs, https GitHub/GitLab URLs and owner/repo shorthand (GitHub) qualify. ssh/scp
+    URLs, other hosts, anything with credentials and local paths do not: a lookup would tell a
+    third party the name of something that may be private. --intel overrides.
+    """
+    if is_local:
+        return False
+    if is_package:
+        return True
+    t = target.strip()
+    if re.match(r"^[\w.-]+/[\w.-]+$", t):
+        return True
+    m = re.match(r"^https://([^/?#]+)(/|$)", t)
+    if not m or "@" in m.group(1):
+        return False
+    return m.group(1).lower() in PUBLIC_HOSTS
 
 
 def _guard(what: str, fn, *a) -> list[Finding]:
@@ -98,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="don't compare with or remember past checks of this target (kept locally, fingerprints only)")
     ap.add_argument("--intel", action=argparse.BooleanOptionalAction, default=None,
                     help="look the target up in OSV (known malware and vulnerabilities) and GitHub (advisories, "
-                         "open security issues, unmerged fixes). Default: on for public targets, off for local dirs")
+                         "open security issues, unmerged fixes). Default: on for npm:, pypi:, github.com and gitlab.com targets; off for local paths, ssh and other hosts")
     ap.add_argument("--no-later", action="store_true",
                     help="skip the extra pass with the clock 45 days ahead (catches time bombs)")
     ap.add_argument("--installed", action="store_true",
@@ -141,14 +170,16 @@ def main(argv: list[str] | None = None) -> int:
     trace: dict[str, bytes] = {}
     runtime_label = "none (static scan only)"
     try:
-        pkg, public = None, True
+        pkg, public = None, False
         if sources.is_package_spec(args.target):
             src, label, cleanup, pkg = sources.fetch_package(args.target)
+            public = True
         elif sources.is_archive(Path(args.target).expanduser()):
             src, label, cleanup = sources.fetch_archive(Path(args.target).expanduser())
-            public = False   # a local file: don't tell anyone its name
         else:
+            local = Path(args.target).expanduser().exists()
             src, label, cleanup = fetch(args.target, args.ref)
+            public = default_intel(args.target, is_local=local)
         if args.subdir:
             sub = (src / args.subdir).resolve()
             if not sub.is_dir() or (sub != src.resolve() and src.resolve() not in sub.parents):
@@ -162,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         plan = detect.plan(src, args.network, args.install, args.run, args.install_timeout,
                            args.run_timeout, args.mcp, later=not args.no_later,
                            **({"deep": True} if args.deep else {}))
-        use_intel = args.intel if args.intel is not None else (public and cleanup is not None)
+        use_intel = args.intel if args.intel is not None else public
         if use_intel:
             pre += _guard("intel", _intel, label, pkg or _manifest_identity(src, plan.ecosystem))
         baits = bait.generate()
@@ -174,18 +205,22 @@ def main(argv: list[str] | None = None) -> int:
             image = ensure_image(quiet=args.agent, engine=runtime.engine)
             budget = sum(p["timeout"] for p in plan.phases) + 120
             trace = run_job(src, job, runtime, image, timeout=budget)
-    except SandboxError as e:
-        print(f"honeyrun: {scrub(e)}", file=sys.stderr)
+    except (SandboxError, OSError, ValueError, tarfile.TarError) as e:
+        # FileNotFoundError (git missing) is an OSError; none of these may end in a traceback.
+        print(f"honeyrun: {scrub(str(e) or type(e).__name__)}", file=sys.stderr)
         return 3
     finally:
         if cleanup:
             shutil.rmtree(cleanup, ignore_errors=True)
 
     if args.keep_trace and trace:
-        out = Path(args.keep_trace)
-        out.mkdir(parents=True, exist_ok=True)
-        for name, data in trace.items():
-            (out / name.lstrip("_")).write_bytes(data)
+        try:
+            out = Path(args.keep_trace)
+            out.mkdir(parents=True, exist_ok=True)
+            for name, data in trace.items():
+                (out / name.lstrip("_")).write_bytes(data)
+        except OSError as e:
+            print(f"honeyrun: could not save the trace: {scrub(e.strerror or type(e).__name__)}", file=sys.stderr)
 
     result = analyze(trace, baits, args.network)
     result.findings = result.findings + pre
@@ -211,15 +246,15 @@ def _manifest_identity(src: Path, ecosystem: str) -> dict | None:
     """Name and version a registry would know this repo by, for OSV."""
     try:
         if ecosystem == "node":
-            meta = json.loads((src / "package.json").read_text(encoding="utf-8"))
+            meta = json.loads(safe_read(src / "package.json") or "null")
             if isinstance(meta, dict) and isinstance(meta.get("name"), str):
                 return {"ecosystem": "npm", "name": meta["name"], "version": str(meta.get("version") or "")}
         if ecosystem == "python":
             import tomllib
-            proj = (tomllib.loads((src / "pyproject.toml").read_text(encoding="utf-8")).get("project") or {})
+            proj = (tomllib.loads(safe_read(src / "pyproject.toml") or "").get("project") or {})
             if isinstance(proj.get("name"), str):
                 return {"ecosystem": "PyPI", "name": proj["name"], "version": str(proj.get("version") or "")}
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):
         pass
     return None
 
@@ -247,6 +282,15 @@ def _agent_configs(args) -> int:
     return _finish(args, result, ctx)
 
 
+def _write(path: str, make) -> None:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(make(), encoding="utf-8")
+    except OSError as e:
+        print(f"honeyrun: could not write {scrub(path)}: {scrub(e.strerror or type(e).__name__)}", file=sys.stderr)
+
+
 def _finish(args, result, ctx) -> int:
     v = report.verdict(result.findings)
     note = None
@@ -261,15 +305,16 @@ def _finish(args, result, ctx) -> int:
             print("\nWhat to do now:\n" + "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1)))
         if note:
             print("\nAI review (advisory, does not change the exit code):\n" + report.note_text(note))
-    if args.json:
-        Path(args.json).write_text(report.to_json(result, ctx, report.note_text(note) if note else None), encoding="utf-8")
-    if args.markdown:
-        Path(args.markdown).write_text(report.to_markdown(result, ctx), encoding="utf-8")
-    if args.sarif:
-        Path(args.sarif).write_text(report.to_sarif(result, ctx, __version__), encoding="utf-8")
     text = report.abuse(result, ctx, __version__) if v == "FAIL" else ""
+    # A bad output path must not hide the verdict: say so, and still return the verdict's exit code.
+    if args.json:
+        _write(args.json, lambda: report.to_json(result, ctx, report.note_text(note) if note else None))
+    if args.markdown:
+        _write(args.markdown, lambda: report.to_markdown(result, ctx))
+    if args.sarif:
+        _write(args.sarif, lambda: report.to_sarif(result, ctx, __version__))
     if args.abuse_report and text:
-        Path(args.abuse_report).write_text(text, encoding="utf-8")
+        _write(args.abuse_report, lambda: text)
     elif text and not args.agent and not args.json:
         print("\nTo report it, run again with --abuse-report FILE for a ready-to-paste report.")
 
