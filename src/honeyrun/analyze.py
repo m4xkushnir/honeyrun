@@ -599,9 +599,9 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
 
     for ev in events:
         if ev.kind == "iouring":
-            # Node's libuv opens a ring on its own and JavaScript cannot drive one directly, so a
-            # node process is noted only; anything else (python/ctypes, native code) is a real bypass.
-            sev = "info" if ev.proc.name in ("node", "nodejs") else "medium"
+            # Many runtimes probe io_uring at startup, and the sandboxes refuse it (gVisor has no io_uring,
+            # Docker's default seccomp blocks it). It can only hide I/O when the ring is actually granted.
+            sev = "medium" if ev.data["ok"] and ev.proc.name not in ("node", "nodejs") else "info"
             add(sev, "io-uring", "io_uring", "uses io_uring (can do I/O that strace cannot see)",
                 f"by {ev.proc.label()}", ev.phase)
         elif ev.kind == "memfd":

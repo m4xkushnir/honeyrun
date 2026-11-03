@@ -18,7 +18,10 @@ import importlib.util
 _spec = importlib.util.spec_from_file_location(
     "honeyrun_agent", Path(__file__).resolve().parents[1] / "src" / "honeyrun" / "sandbox" / "agent.py")
 agent = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(agent)
+try:
+    _spec.loader.exec_module(agent)
+except ImportError:          # the in-sandbox agent is Linux-only (pwd); its tests skip elsewhere
+    agent = None
 
 
 def hx(s: str) -> str:
@@ -112,7 +115,8 @@ class OpenModeIps(Base):
 
     def test_open_mode_ip_after_lookup_is_info(self):
         q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x08registry\x05npmjs\x03org\x00\x00\x01\x00\x01"
-        lookup = (f'1 10:00:00.0 sendto(4<UDP:[1->2:53]>, "{"".join(f"\\x{c:02x}" for c in q)}", {len(q)}, 0, NULL, 0) = {len(q)}\n')
+        qhex = "".join(f"\\x{c:02x}" for c in q)   # built outside the f-string: Python 3.11 forbids backslashes there
+        lookup = f'1 10:00:00.0 sendto(4<UDP:[1->2:53]>, "{qhex}", {len(q)}, 0, NULL, 0) = {len(q)}\n'
         _, rules = self.run_a(self.trace(lookup + self.connect("93.184.216.34")), network="open")
         self.assertIn(("network", "info"), rules)
         self.assertNotIn(("network", "medium"), rules)
@@ -142,6 +146,7 @@ class Lingering(Base):
         a, rules = self.run_a({"meta.json": json.dumps(meta).encode()})
         self.assertNotIn("delayed-activation", {r for r, _ in rules})
 
+    @unittest.skipIf(agent is None, "the in-sandbox agent is Linux-only")
     def test_agent_keeps_watching_for_twenty_seconds(self):
         self.assertGreaterEqual(agent.LINGER_WINDOW, 20)
 
@@ -163,6 +168,7 @@ class Degraded(Base):
         self.assertIn(("incomplete", "medium"), rules)
         self.assertNotIn(("incomplete", "high"), rules)
 
+    @unittest.skipIf(agent is None, "the in-sandbox agent is Linux-only")
     def test_netlog_caps_payload_and_keeps_latest_records(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(agent, "TCP_LOG_CAP", 200_000), \
                 mock.patch.object(agent, "RING", 5):
@@ -209,6 +215,7 @@ class Cwd(Base):
         s = f'1 t openat(AT_FDCWD</tmp>, "{hx("x")}", O_RDONLY) = 3\n'
         self.assertEqual([e.data["path"] for e in parse_strace(s, "run") if e.kind == "open"], ["/tmp/x"])
 
+    @unittest.skipIf(agent is None, "the in-sandbox agent is Linux-only")
     def test_agent_traces_chdir_and_io_uring(self):
         for call in ("chdir", "fchdir", "io_uring_setup", "io_uring_enter", "io_uring_register"):
             self.assertIn(call, agent.SYSCALLS.split(","))
@@ -241,6 +248,12 @@ class IoUring(Base):
         _, rules = self.run_a(self.trace(s))
         self.assertIn(("io-uring", "medium"), rules)
 
+    def test_refused_ring_is_only_info(self):
+        # gVisor and Docker's seccomp refuse io_uring: a failed probe hides nothing
+        s = '1 t io_uring_setup(256, {flags=0}) = -1 ENOSYS (Function not implemented)\n'
+        _, rules = self.run_a(self.trace(s))
+        self.assertNotIn(("io-uring", "medium"), rules)
+
     def test_node_libuv_is_only_info(self):
         s = (f'1 t execve("{hx("/usr/local/bin/node")}", ["{hx("node")}", "{hx("x.js")}"], 0x0 /* 1 vars */) = 0\n'
              '1 t io_uring_setup(256, {flags=0}) = 5<anon_inode:[io_uring]>\n')
@@ -249,6 +262,7 @@ class IoUring(Base):
         self.assertNotIn(("io-uring", "medium"), rules)
 
 
+@unittest.skipIf(agent is None, "the in-sandbox agent is Linux-only")
 class ExtractRepo(unittest.TestCase):
     def test_symlink_member_not_followed(self):
         import io

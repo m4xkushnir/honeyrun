@@ -46,6 +46,7 @@ class PackSymlinks(unittest.TestCase):
 
 
 class SafeRead(unittest.TestCase):
+    @unittest.skipIf(not hasattr(os, "mkfifo"), "no FIFOs on this OS")
     def test_special_files_do_not_hang(self):
         with tempfile.TemporaryDirectory() as t:
             d = Path(t)
