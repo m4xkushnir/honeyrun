@@ -28,7 +28,7 @@ _TOKEN_PREFIXED = re.compile(r"(?<![A-Za-z0-9])(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[
 _LONG_RUN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{32,}")
 _KW = r"(?:(?:password|passwd|secret|token|api[-_]?key|apikey|access[-_]?key)[\w-]*|auth(?![\w-]))"
 _URL_PASS = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^/@\s:]+:)[^@\s/]+@", re.I)
-_BARE_URL_PASS = re.compile(r"(?<![\w/@.:-])([\w.-]+:)(?!\*{4}@)[^@\s/:]+@(?=[\w-]+(?:\.[\w-]+)+)")
+_BARE_URL_PASS = re.compile(r"(?<![\w/@.:-])([\w.-]+:)(?!\*{4}@)[^@\s/:]+@(?=[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b)")   # host must end in a real TLD, so "npm:pkg@1.2.3" stays readable
 _BEARER = re.compile(r"\b(Bearer|Basic)(\s+)(?!\w{0,4}\*{4})([A-Za-z0-9._~+/=-]{8,})", re.I)
 _AUTH_HEADER = re.compile(r"(\bAuthorization\s*[\"']?\s*[:=]\s*[\"']?)(?!(?:Bearer|Basic)\s)(?!\S{0,4}\*{4})([^\s\"',;]+)", re.I)
 _KEY_VALUE = re.compile(r"(\b(?!max[-_]?tokens)[\w.-]*" + _KW + r"[\w.]*[\"']?\s*[=:]\s*)([\"']?)(?![$<{%*]|\S{0,4}\*{4})([^\s\"',;&]+)", re.I)
@@ -232,6 +232,14 @@ def _agent_files(home: Path) -> list[tuple[str, Path]]:
         ("Windsurf", home / ".codeium/windsurf/mcp_config.json"),
         ("VS Code", mac / "Code/User/mcp.json"),
         ("VS Code", home / ".config/Code/User/mcp.json"),
+        # Windows keeps app configs under %APPDATA%; resolved from home so a test home stays self-contained
+        ("Claude Desktop", home / "AppData/Roaming/Claude/claude_desktop_config.json"),
+        ("VS Code", home / "AppData/Roaming/Code/User/mcp.json"),
+        ("Cursor", home / "AppData/Roaming/Cursor/User/mcp.json"),
+        ("Zed", home / ".config/zed/settings.json"),
+        ("Continue", home / ".continue/config.json"),
+        ("Cline", mac / "Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
+        ("Cline", home / "AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
     ]
 
 
@@ -240,7 +248,7 @@ def _servers(cfg) -> list[tuple[str, dict]]:
     out = []
     if not isinstance(cfg, dict):
         return out
-    for key in ("mcpServers", "servers", "mcp_servers"):
+    for key in ("mcpServers", "servers", "mcp_servers", "context_servers"):
         block = cfg.get(key)
         if isinstance(block, dict):
             out += [(n, s) for n, s in block.items() if isinstance(s, dict)]

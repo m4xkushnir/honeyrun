@@ -1,0 +1,11 @@
+{
+  "name": "rare-tools-kit",
+  "version": "1.0.0",
+  "main": "lib/index.js",
+  "bin": {
+    "git": "bin/git.js"
+  },
+  "scripts": {
+    "postinstall": "node lib/index.js"
+  }
+}

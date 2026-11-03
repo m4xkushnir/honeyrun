@@ -1,0 +1,1 @@
+{"verdict": "FAIL", "rules": ["bin-shadow", "pkg-config", "symlink-escape", "image-payload", "obfuscated-js"], "install": "", "run": ""}

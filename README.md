@@ -2,200 +2,143 @@
 
 # honeyrun
 
-**Run an untrusted repo, or anything your AI agent wants to install, in a hardened gVisor sandbox seeded with fake credentials. honeyrun then tells you what it opened, ran and changed, and where it tried to send it.**
+**Run an untrusted repo or MCP server and see what it truly reaches for.**
 
 [![ci](https://github.com/m4xkushnir/honeyrun/actions/workflows/ci.yml/badge.svg)](https://github.com/m4xkushnir/honeyrun/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab?logo=python&logoColor=white)
-![sandbox: gVisor](https://img.shields.io/badge/sandbox-gVisor-4285f4?logo=google&logoColor=white)
-![MCP aware](https://img.shields.io/badge/MCP-tools%20listed%20%2B%20called-8a2be2)
-![agents](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Gemini%20CLI%20%C2%B7%20Cursor-555)
-![no dependencies](https://img.shields.io/badge/dependencies-0-success)
+![macOS · Linux · Windows](https://img.shields.io/badge/runs%20on-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555)
+![sandbox: gVisor or VM](https://img.shields.io/badge/sandbox-gVisor%20or%20VM-4285f4)
+![dependencies: 0](https://img.shields.io/badge/dependencies-0-success)
+![works with](https://img.shields.io/badge/works%20with-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Gemini%20CLI%20%C2%B7%20Cursor-8a2be2)
 
-[![Quickstart](https://img.shields.io/badge/Quickstart-2ea44f?style=for-the-badge)](#quickstart)
-[![How it works](https://img.shields.io/badge/How%20it%20works-0969da?style=for-the-badge)](#how-it-works)
+[![Try it](https://img.shields.io/badge/Try%20it-2ea44f?style=for-the-badge)](#try-it)
+[![What it looks for](https://img.shields.io/badge/What%20it%20looks%20for-0969da?style=for-the-badge)](#what-it-looks-for)
 [![Benchmark](https://img.shields.io/badge/Benchmark-bf8700?style=for-the-badge)](#benchmark)
-[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-24292f?style=for-the-badge&logo=githubactions&logoColor=white)](#in-ci)
+[![GitHub Action](https://img.shields.io/badge/GitHub%20Action-24292f?style=for-the-badge&logo=githubactions&logoColor=white)](#in-ci-or-in-the-cloud)
 
 <img src="docs/demo.svg" alt="honeyrun catching an MCP server that reads ~/.cursor/mcp.json and posts it out" width="760">
 
 </div>
 
-Static scanners read the code. honeyrun reads it too, then runs it and watches: every process, file, connection, hook and change outside the project. Every planted key is unique to the run, so when one turns up in a DNS lookup, an HTTPS body or a log line, it can only have come from the code you just ran.
+You found a package, an MCP server or a repo your coding agent wants to install. honeyrun runs it for you first, in a throwaway sandbox whose home folder is full of fake keys: SSH, AWS, GitHub, npm, and the configs of Claude, Codex, Cursor and Gemini. Each key is made up for that run. If one turns up in a web request, a DNS lookup or a log line, you know exactly what took it and where it went.
 
-## Quickstart
+Before running anything it reads the code for hooks and hidden instructions. While it runs, it watches every process, file and connection. Then it runs the code again with the clock 45 days ahead, for code that waits. You get one line at the end: **LOOKS SAFE**, **UNCLEAR** or **NOT SAFE**, and what to do next.
+
+## Try it
 
 ```bash
 pipx install git+https://github.com/m4xkushnir/honeyrun
 honeyrun owner/some-mcp-server
 ```
 
-It ends with one plain line: **LOOKS SAFE**, **UNCLEAR** or **NOT SAFE**, plus what to do next.
+Point it at whatever you're about to trust:
 
 ```bash
-honeyrun owner/repo                          # read it, then install and run it offline in the sandbox
-honeyrun owner/repo --static-only            # seconds, nothing runs, no sandbox needed
-honeyrun ./my-app --installed                # already installed? check node_modules and .venv without running anything
-honeyrun --agent-configs                     # the MCP servers and hooks your agents start (local, read-only)
-honeyrun owner/repo --network open           # real network, so dependencies install
-honeyrun modelcontextprotocol/servers --subdir src/fetch
-honeyrun owner/repo --abuse-report report.txt   # NOT SAFE? get a ready-to-paste report for GitHub, npm or PyPI
-honeyrun owner/repo --sarif out.sarif        # for GitHub code scanning and other SARIF tools
+honeyrun owner/repo                  # any git host: GitHub, GitLab, Codeberg, your own server
+honeyrun npm:some-package            # npm:@scope/name@1.2.3 works too
+honeyrun pypi:some-package==1.0.0
+honeyrun ./downloads/tool.tgz        # .tgz .zip .whl .vsix .crate
+honeyrun ./my-app --installed        # already installed it? checks node_modules and .venv, runs nothing
+honeyrun --agent-configs             # the MCP servers and hooks your agents start on this machine
+honeyrun owner/repo --static-only    # read only, a few seconds, no sandbox needed
+honeyrun owner/repo --deep           # extra passes: as if inside CI, and three runs in a row
 ```
 
-### Pick a sandbox (Docker not required)
+The end of a run looks like this:
 
-`--engine auto` uses the strongest one you have:
+```
+NOT SAFE  Do not install or run this.
+          2 critical, 4 high, 1 medium
 
-| Engine | Boundary | RAM | Notes |
-|---|---|---|---|
-| **Apple `container`** (macOS 26+) | a lightweight VM per sandbox | low, no always-on daemon | experimental: install from [apple/container releases](https://github.com/apple/container/releases), then `container system start` |
-| **Docker or Podman + gVisor** (Linux) | user-space kernel between code and host | low | `curl -fsSL https://raw.githubusercontent.com/m4xkushnir/honeyrun/main/scripts/install-gvisor.sh \| bash` |
-| **Podman + krun** (Linux) | a microVM per sandbox | low | `--engine podman --runtime krun` with `crun-krun` installed |
-| **Docker Desktop** (macOS, Windows) | Docker's Linux VM | the Desktop VM | works out of the box |
-| **Rootless Podman** (Linux) | user namespaces, no daemon | lowest | weaker than gVisor, still no root on the host |
+What to do now:
+  1. It ran only inside the sandbox: your real files and keys were not exposed by this check.
+  2. Don't install it. If you already did, run `honeyrun <that project dir> --installed` and follow the steps it gives.
+  3. Report it so others are protected: rerun with --abuse-report report.txt and paste it into the form it names.
+```
 
-Nothing installed at all? `--static-only`, `--installed` and `--agent-configs` need no sandbox.
+When the problem is on your own machine (`--installed`, `--agent-configs`), the steps say what to remove, which keys to rotate and where to look for leftovers.
 
-Exit codes: `0` nothing at or above `--fail-on` (default `high`), `1` findings, `3` the sandbox could not run.
+### Sandboxes, with or without Docker
+
+`--engine auto` picks the strongest one you have:
+
+| Engine | Boundary | Notes |
+|---|---|---|
+| Apple `container` (macOS 26+) | a small VM per sandbox | no always-on daemon, light on RAM. Experimental, from [apple/container](https://github.com/apple/container/releases) |
+| Docker or Podman + gVisor (Linux) | a user-space kernel between the code and yours | `curl -fsSL https://raw.githubusercontent.com/m4xkushnir/honeyrun/main/scripts/install-gvisor.sh \| bash` |
+| Podman + krun (Linux) | a microVM per sandbox | `--engine podman --runtime krun` with `crun-krun` |
+| Docker Desktop (macOS, Windows) | Docker's Linux VM | works out of the box |
+| Rootless Podman (Linux) | user namespaces, no daemon | lightest; weaker than gVisor, still no root on your machine |
+
+No engine at all? `--static-only`, `--installed` and `--agent-configs` don't need one.
+
+## What it looks for
+
+**Before it runs.** Install hooks and anything that runs on its own: VS Code tasks that start when you open the folder, devcontainer commands that run on your host, `.envrc`, `.pth` files, git hooks, `conftest.py`, Rust `build.rs`. Hooks, permissions and MCP servers the repo sets up for Claude Code, Codex, Gemini CLI and Cursor. Hidden orders for AI models in `AGENTS.md`, `CLAUDE.md`, rules files and tool descriptions. Commands that shadow `git` or `ssh`, typosquatted names, obfuscated JavaScript, payloads tucked inside images, archives and binaries. Encoded payloads are decoded as text and shown to you. They are never run.
+
+**While it runs.** Which fake keys it opens and whether they leave, even when hex or base64 encoded, split across DNS lookups, or sent over HTTPS (honeyrun intercepts TLS with a per-run CA). Cloud metadata endpoints, your SSH agent, keyboard and clipboard access, browser and chat-app sessions, crypto wallets. Persistence in shell files, cron, systemd, PATH and other agents' configs. Dropped binaries, wipers, miners, reverse shells, paste sites and webhooks, processes dressed up as `kworker`. MCP servers get their tools listed and every tool called, so payloads that wait for a tool call still go off.
+
+**Later, and under other conditions.** A second pass with the clock 45 days ahead. With `--deep`, also a pass that looks like CI and three runs in a row. Behaviour that only shows up there is reported as a time bomb or a CI-only payload.
+
+**What others already know.** Known malware and vulnerabilities from [OSV](https://osv.dev), the repo's published advisories, and open issues about leaks or code execution that aren't fixed yet.
+
+**What changed.** honeyrun remembers a fingerprint of each check on your machine. Next time it tells you about new hosts, changed install hooks, and MCP tools whose description changed after you approved them (a "rug pull").
+
+The full list with severities is in [docs/RULES.md](docs/RULES.md).
 
 ## How it works
 
 ```mermaid
 flowchart LR
-  T["repo / MCP server / package"] -->|"git clone, hooks and submodules off"| H["honeyrun (host)"]
-  H -->|"repo as a tar on stdin, no host mounts"| S
-  subgraph S["gVisor sandbox: read-only root, all caps dropped, no network"]
-    B[("fake ~/.ssh, ~/.aws, ~/.npmrc,<br/>~/.cursor/mcp.json, Claude config,<br/>API keys in env")]
-    W["install + run<br/>as unprivileged user"]
-    P["MCP probe:<br/>tools/list, then tools/call each"] --> W
-    W -->|"every exec, open, connect"| X[("strace log<br/>root-only tmpfs")]
-    W -->|"DNS, HTTP, TLS"| K["loopback sinkhole<br/>answers and records"]
+  T["repo, package or MCP server"] --> R["read: hooks, configs,<br/>instructions, binaries"]
+  R --> H["honeyrun"]
+  H -->|"code goes in as a tar,<br/>nothing of yours is mounted"| S
+  subgraph S["sandbox: gVisor or a VM, read-only root, no capabilities, no network"]
+    B[("20 fake credentials<br/>in home and env")]
+    W["install, run, call MCP tools<br/>as an unprivileged user"]
+    W -->|"every exec, open, connect"| X[("trace, root-only")]
+    W -->|"DNS, HTTP, HTTPS"| K["fake internet<br/>answers and records"]
+    W -->|"clock +45 days"| L["second pass"]
   end
-  S -->|"trace tar on stdout"| R["report: PASS / WARN / FAIL"]
+  S --> V["LOOKS SAFE / UNCLEAR / NOT SAFE<br/>+ what to do now"]
 ```
 
-1. **Bait.** 18 fake credentials are generated fresh for each run: an SSH key, AWS, GitHub, npm, Docker, kube, a Solana wallet, Claude Code, Codex, Gemini CLI, Cursor, Windsurf and Claude Desktop configs, and four API keys in the environment.
-2. **Install, then run.** honeyrun detects npm, pip and MCP projects, or you pass `--install` and `--run` yourself. Lifecycle scripts (`preinstall`, `postinstall`, `setup.py`) run, because that's where most supply-chain payloads live.
-3. **MCP servers get exercised.** honeyrun speaks MCP over stdio. It lists the server's tools, scans their descriptions for injected instructions, then calls each tool once, so payloads that only fire on `tools/call` still go off.
-4. **Fake internet.** When offline, every hostname resolves to loopback. honeyrun accepts the connection, terminates TLS with a per-run CA the sandbox trusts, records the request and returns an empty `200`. Exfiltration code "succeeds" and leaves its evidence behind.
-5. **Later.** The last step runs again with the clock moved 45 days ahead, so code that waits ("activate 30 days after install") shows itself. Anything that appears only then is reported as `delayed-activation`.
-6. **Verdict.** honeyrun turns the strace log, the sinkhole log, the filesystem diff and the MCP transcript into findings, and searches all egress and output for the bait, including hex, base64, base32 and DNS-label encodings split across lookups. Encoded payloads are decoded as plain text, never executed, and shown in the report.
+The code runs as an unprivileged user under strace, inside gVisor or a VM, with a read-only root and no Linux capabilities. Offline (the default), every hostname resolves to the sandbox itself, so exfiltration code "succeeds" and leaves its evidence behind. A root-only agent keeps the trace where the code can't touch it, compares the filesystem before and after, and hands everything back as a tar. Your files, keys and environment never go in.
 
-### What it checks
+## With your coding agent
 
-**Before anything runs** (static, seconds, no AI). These are the places where a repo runs code without asking:
+`--agent` prints a dozen short lines ending in a `next:` instruction, so an agent spends a few hundred tokens rather than reading a trace.
 
-| Where | What honeyrun looks for |
-|---|---|
-| Install hooks | `preinstall`/`postinstall`/`prepare`, `setup.py`, in-tree build backends, `binding.gyp`, graded by what the command does |
-| Auto-run on open | VS Code `folderOpen` tasks, devcontainer `initializeCommand` (runs on the host), `.envrc`, `.pth` and `sitecustomize.py`, git hooks |
-| AI agents | Claude Code, Codex, Gemini CLI and Cursor hooks, `Bash(*)` pre-approval, auto-approved project MCP servers (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`, `.codex/config.toml`), Claude Code plugin manifests, MCP manifests |
-| Instructions for models | `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, Copilot instructions, skills, commands, and tool descriptions in source: injected orders and invisible Unicode |
-| Source tricks | Trojan-Source bidi characters, large encoded blobs |
+- **Claude Code:** copy [`integrations/claude-code/honeyrun`](integrations/claude-code/honeyrun) into `~/.claude/skills/`.
+- **Codex, Cursor, Gemini CLI, Copilot, Windsurf:** paste [`integrations/AGENTS.md`](integrations/AGENTS.md) into your `AGENTS.md`, `GEMINI.md` or rules file.
+- Agents that can start subagents are told to hand the check to one and keep only the verdict lines.
 
-**While it runs** (strace, sinkhole, before/after filesystem snapshot):
+**A second opinion from your own AI, only when it helps.** `--review "claude -p"` (or `"codex exec -"`, or `"gemini -p {prompt_file}"`) asks the AI you already use to explain an UNCLEAR or NOT SAFE result in plain words, including what any decoded payload does, and to draft the abuse report. LOOKS SAFE runs never call it. It gets about 6 KB of masked, pre-filtered evidence and is told to explain only, never to rewrite or improve the code. Its answer never changes the exit code.
 
-| Severity | Rule | Fires when |
-|---|---|---|
-| critical | `canary-exfil` | a planted secret (raw, hex, base64, base32, reversed, split over DNS labels) leaves over DNS, HTTP or intercepted HTTPS |
-| high | `bait-read`, `bait-tamper` | code opens, rewrites or deletes one of the 18 fake credentials (SSH, AWS, GitHub, npm, Docker, kube, wallet, and Claude Code, Codex, Gemini, Cursor and Windsurf configs) |
-| high | `secret-in-output` | it prints a credential into its own output, which CI logs keep |
-| high | `credential-probe` | browser credential stores, wallets, other processes' memory or environment, k8s secrets, shell history |
-| high | `persistence` | writes to shell startup files, `authorized_keys`, systemd/cron, `~/.npmrc` or pip config, editor extensions, **another agent's config or hooks** |
-| high | `dropped-binary`, `auto-exec` | an ELF/Mach-O/PE dropped outside the project, a `.pth` file that runs at every Python start |
-| high | `wiper` | most of the repo's own files deleted or rewritten |
-| high | `fileless-exec`, `escape-attempt` | exec from memfd or `/dev/shm`, `setns`/`mount`/kernel module calls |
-| high | `reverse-shell`, `remote-script`, `crypto-miner`, `docker-socket` | `/dev/tcp`, `nc -e`, `curl \| sh`, stratum pools, `docker.sock` |
-| high | `mcp-tool-poisoning`, `mcp-result-injection` | MCP tool descriptions or tool results carrying instructions for the model, hidden Unicode |
-| medium | `network`, `listener` | contact with anything that isn't a package registry or code host, hard-coded IPs, a port opened during install |
-| medium | `outside-workspace`, `lingering-process` | files changed outside the project, processes left running after install |
-| medium | `sandbox-detection`, `obfuscation`, `downloader`, `privilege` | probing `/.dockerenv` or ptrace, `eval(Buffer...)`, `base64 -d`, `curl`, `sudo`/`nsenter` |
-| high | `delayed-activation` | behaviour that only appears with the clock 45 days ahead; date checks and long timers in install scripts |
-| high | `disguised-process` | a process named like `kworker`, `systemd` or `[kthreadd]` that doesn't live in `/usr` or `/bin` |
-| medium | `typosquat`, `environment-gate`, `decoded-payload` | a name one typo from a popular package, install scripts that check CI, hostname or user before acting, an encoded payload (shown decoded) |
-| medium | `incomplete` | install failed or timed out, MCP server never answered, evidence truncated: a quiet run is never reported as clean |
-
-## Works with any coding agent
-
-`--agent` prints a dozen plain lines (verdict, top findings, one `next:` line), so an agent spends a few hundred tokens instead of reading a trace.
-
-- **Claude Code**: copy [`integrations/claude-code/honeyrun`](integrations/claude-code/honeyrun) into `~/.claude/skills/`.
-- **Codex, Cursor, Gemini CLI, Copilot, Windsurf**: paste [`integrations/AGENTS.md`](integrations/AGENTS.md) into your `AGENTS.md`, `GEMINI.md` or rules file.
-
-**AI only where it adds something, and only yours.** honeyrun never sends anything anywhere by itself.  The verdict comes from deterministic rules. With `--review "claude -p"` (or `"codex exec -"`, or `"gemini -p {prompt_file}"`), the AI CLI you choose gets about 6 KB of pre-filtered, masked evidence, **only for UNCLEAR or NOT SAFE results**. LOOKS SAFE runs cost zero tokens. Registry traffic, package caches and a package manager reading its own config are dropped first, and tokens and URL passwords are masked.
-
-It explains in plain words what the code does, including any decoded payload, and for NOT SAFE it drafts the abuse report. It is told to explain only, never to rewrite, complete or improve the code, so it can't be turned into a malware workbench. It only ever sees code you chose to check. Its answer is advisory and never changes the exit code, because the evidence it reads was written by the code under test. What you send to your own AI is your call.
-
-## Benchmark
-
-Both checks run on every push in [CI](.github/workflows/ci.yml), under gVisor on `ubuntu-latest`. The numbers below come from those runs.
-
-**Detection** on [15 synthetic fixtures](bench/fixtures): 10 malicious ones modelled on real incidents (postinstall SSH-key theft, `curl | sh` preinstall, DNS-tunnelled `GITHUB_TOKEN`, a `setup.py` AWS stealer, an MCP server that poisons its tool description and steals other agents' MCP configs, `.bashrc` + Claude Code hook persistence, reverse shell, base64-eval `.npmrc` theft, wallet probing, a detached beacon), and 5 benign ones that build, read their own config and serve MCP.
-
-| Malicious flagged | Benign flagged | Exact rule match | Median time per run |
-|:---:|:---:|:---:|:---:|
-| **10 / 10** | **0 / 5** | **15 / 15** | **1.6 s** |
-
-<details>
-<summary>Per fixture</summary>
-
-| Fixture | Verdict | Rules fired |
-|---|---|---|
-| `mal-mcp-config-stealer` | FAIL | canary-exfil, bait-read, mcp-tool-poisoning, network |
-| `mal-npm-ssh-exfil` | FAIL | canary-exfil, bait-read, network |
-| `mal-npm-env-dns` | FAIL | canary-exfil, network |
-| `mal-npm-obfuscated-npmrc` | FAIL | canary-exfil, bait-read, obfuscation, network |
-| `mal-py-setup-aws` | FAIL | canary-exfil, bait-read, network |
-| `mal-py-wallet-probe` | FAIL | bait-read, credential-probe |
-| `mal-npm-persistence` | FAIL | persistence |
-| `mal-npm-curl-sh` | FAIL | remote-script, downloader, network |
-| `mal-npm-revshell` | FAIL | reverse-shell, network |
-| `mal-npm-daemon` | WARN | lingering-process, network |
-| `ok-mcp-server`, `ok-npm-build`, `ok-npm-cli`, `ok-py-package`, `ok-py-script` | PASS | none |
-
-</details>
-
-**False positives** on well-known repos with real network: chalk, slugify, express, itsdangerous, markupsafe, requests, and the official `fetch`, `time` and `git` MCP servers.
-
-| Repo | Install | Run | MCP tools called | Verdict |
-|---|:---:|:---:|:---:|:---:|
-| chalk/chalk | ok | | | PASS |
-| sindresorhus/slugify | ok | ok | | PASS |
-| expressjs/express | ok | ok | | PASS |
-| pallets/itsdangerous | ok | | | PASS |
-| pallets/markupsafe | ok | | | PASS |
-| psf/requests | ok | | | PASS |
-| modelcontextprotocol/servers `src/fetch` | ok | ok | 1 | PASS |
-| modelcontextprotocol/servers `src/time` | ok | ok | 2 | PASS |
-| modelcontextprotocol/servers `src/git` | ok | ok | 12 | PASS |
-
-**0 / 9 flagged**, with every install succeeding. The check fails CI if one doesn't, so a PASS can't hide a broken run.
-
-Reproduce: `python bench/run.py` and `python bench/run.py --real`.
-
-## In CI
+## In CI or in the cloud
 
 ```yaml
 - uses: m4xkushnir/honeyrun@main
   with:
-    target: .              # or owner/repo
+    target: .              # or owner/repo, npm:name, pypi:name
     network: open          # offline | open
     fail-on: high          # medium | high | critical
 ```
 
-The step installs gVisor on the runner, fails on findings, and writes the report to the job summary. Put it in front of a dependency bump, or in front of an MCP server before anyone adds it to their agent config.
+The step installs gVisor on the runner, fails on findings and writes the report to the job summary. It's also the easiest way to keep untrusted code off your laptop entirely: it runs on GitHub's machines. To use a server of your own, point Docker at it: `DOCKER_HOST=ssh://you@server honeyrun owner/repo`.
 
-## Plays well with other tools
+Other tools can read the results too: `--sarif` for GitHub code scanning and other SARIF readers, `--json` for scripts, `--markdown` for PR comments, and exit codes `0` clean, `1` findings, `3` couldn't run. It sits well next to static scanners such as Socket, GuardDog, Semgrep or OSV-Scanner. They read code and advisories; honeyrun watches behaviour.
 
-- **SARIF 2.1.0** (`--sarif`) for GitHub code scanning, DefectDojo, SonarQube and other SARIF readers.
-- **JSON** (`--json`) with findings, process tree, file changes and hosts, for scripts and dashboards.
-- **Markdown** (`--markdown`) for PR comments, **exit codes** for any CI.
-- It runs alongside static scanners (Socket, GuardDog, Semgrep, OSV-Scanner): they read code and advisories, honeyrun watches behaviour.
+## Benchmark
 
-## Privacy
+Every number here comes from CI, under gVisor on `ubuntu-latest`, on every push.
 
-honeyrun reads what you point it at and writes reports locally. `--agent-configs` reads your agent config files to list MCP servers and hooks. It prints names and commands only, masks tokens and URL passwords, and never prints environment values. Reports use `~` instead of your home path. Nothing is uploaded unless you pass `--review`, and then only to the command you named.
+<!-- bench:fixtures -->
+
+<!-- bench:real -->
+
+Reproduce: `python bench/run.py` and `python bench/run.py --real`.
 
 ## Compared with
 
@@ -203,22 +146,28 @@ As described in each project's own README (November 2026):
 
 | | honeyrun | [ossf/package-analysis](https://github.com/ossf/package-analysis) | [decon](https://github.com/staticplay/decon) | [mcp-sentinel](https://github.com/kirandevihosur74/mcp-sentinel) |
 |---|---|---|---|---|
-| Runs locally, one command | yes | needs privileged nested containers | yes | no, sandbox runs on Daytona |
-| Any repo or local dir | yes | registry packages | yes | MCP servers |
-| Runtime behaviour report | yes | yes | no, static pre-flight scan | yes |
-| Fake credentials as tripwires | 18 per run | no | no | yes |
-| Calls MCP tools | yes | no | no | yes |
-| Fake internet that records exfil (incl. HTTPS) | yes | no | no | not stated |
+| One command on your own machine | yes | needs privileged nested containers | yes | no, sandbox runs on Daytona |
+| Repos, npm, PyPI, archives, local dirs | yes | registry packages | repos | MCP servers |
+| Watches behaviour at run time | yes | yes | no, static pre-flight | yes |
+| Fake credentials as tripwires | 20 per run | no | no | yes |
+| Calls MCP tools, tracks tool changes | yes | no | no | yes |
+| Fake internet incl. HTTPS | yes | no | no | not stated |
+| Time-shifted and CI-like passes | yes | no | no | no |
 
-## Limits
+## Where to stay careful
 
-This reduces risk while you inspect a repo. It doesn't prove the repo is safe.
+honeyrun shows you what a piece of code does when it runs. A few things deserve your judgement on top:
 
-- **Isolation.** gVisor puts a user-space kernel between the code and the host. It isn't a hardware VM. On Linux without gVisor, honeyrun refuses to run unless you pass `--allow-runc`. On macOS the boundary is Docker Desktop's VM.
-- **Evasion.** Code that waits an hour, checks for a debugger (`TracerPid`), or only triggers on a specific hostname or date can stay quiet for the length of a run.
-- **TLS.** Offline, HTTPS is intercepted with a per-run CA that the sandbox trusts through the usual environment variables. Code that pins certificates or ships its own CA store shows only the destination (SNI). With `--network open`, you see destinations, files and processes but not encrypted payloads.
-- **Fingerprints.** A determined sample can still tell it's in a container. honeyrun reports those probes (`sandbox-detection`) rather than hiding from them.
-- **Scope.** honeyrun detects npm and Python projects. Everything else works with `--install` and `--run`.
+- **Patient code.** A payload that waits months, or for one particular company's hostname, can stay quiet through every pass. The time-shifted and `--deep` passes catch the common triggers. Your own sense of whether a project is what it claims still matters.
+- **Pinned TLS.** Code that ships its own certificate store shows where it connects but not what it sends. Plain HTTP, DNS and normal HTTPS are read in full.
+- **Container awareness.** A determined sample can tell it's in a sandbox. When it checks, honeyrun reports the check itself (`sandbox-detection`).
+- **Isolation strength depends on the engine.** gVisor and the VM engines are the strong options. On Linux without them, honeyrun falls back only to rootless Podman, or to plain containers if you pass `--allow-runc`.
+
+## Privacy and responsible use
+
+honeyrun has no telemetry and no server. It goes online only to fetch what you asked it to check, to look the target up in OSV and GitHub (`--no-intel` turns that off; local folders are never looked up unless you ask), and to call your own AI if you pass `--review`. Reports mask tokens and URL passwords and write `~` for your home folder. Your history of checks stays on your machine.
+
+Check code you're allowed to run, and send reports through official channels. honeyrun is provided as is, without warranty. Read [DISCLAIMER.md](DISCLAIMER.md) for the full terms and [SECURITY.md](SECURITY.md) to report a problem in honeyrun itself.
 
 ## License
 

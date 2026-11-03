@@ -101,6 +101,18 @@ def generate() -> list[Bait]:
         {"mcpServers": {"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
                                    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": windsurf}}}}, indent=2)))
 
+    # cloud and secret-manager logins: a refresh token or a Vault token is a standing session
+    gcp_refresh = "1//0g" + _tok(58, ALNUM + "_-")
+    gcp_secret = "GOCSPX-" + _tok(28, ALNUM + "_-")
+    baits.append(Bait("Google Cloud credentials", gcp_refresh, ".config/gcloud/application_default_credentials.json",
+                      content=json.dumps({"account": "", "client_id": _tok(12, string.digits) + "-" + _tok(32, string.ascii_lowercase + string.digits) + ".apps.googleusercontent.com",
+                                          "client_secret": gcp_secret, "refresh_token": gcp_refresh,
+                                          "type": "authorized_user", "universe_domain": "googleapis.com"}, indent=2),
+                      extra=(gcp_secret,)))
+
+    vault = "hvs." + _tok(91, ALNUM + "_-")
+    baits.append(Bait("Vault token", vault, ".vault-token", content=vault))
+
     for label, var, value in (
         ("GITHUB_TOKEN env", "GITHUB_TOKEN", "ghp_" + _tok(36)),
         ("OPENAI_API_KEY env", "OPENAI_API_KEY", "sk-proj-" + _tok(48)),

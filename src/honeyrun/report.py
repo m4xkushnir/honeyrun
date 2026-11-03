@@ -203,3 +203,56 @@ def to_sarif(a: Analysis, ctx: dict, version: str) -> str:
             "properties": {"verdict": verdict(a.findings), "target": clean(ctx["target"]), "sandbox": ctx["runtime"]},
         }],
     }, indent=2)
+
+
+# ----------------------------------------------------------------- what to do now
+
+ROTATE = {
+    "SSH": "SSH keys: make a new key, replace it on GitHub/GitLab/servers, delete the old one",
+    "AWS": "AWS keys: deactivate them in IAM and create new ones",
+    "GitHub": "GitHub tokens: revoke at github.com/settings/tokens and sign out other sessions",
+    "npm": "npm tokens: revoke with `npm token revoke` or at npmjs.com/settings/tokens",
+    "Docker": "Docker registry logins: `docker logout`, revoke the access token",
+    "Kubernetes": "Kubernetes: rotate the service-account token / kubeconfig credentials",
+    "wallet": "Crypto wallets: move funds to a new wallet with a new seed phrase",
+    "API_KEY": "AI API keys (OpenAI, Anthropic, Gemini): revoke and reissue in each provider's console",
+    "Claude": "Claude Code / Claude Desktop: sign out and back in, check ~/.claude/settings.json hooks",
+    "Codex": "Codex: sign out and back in, check ~/.codex/config.toml",
+    "Cursor": "Cursor: check ~/.cursor/mcp.json and the keys in it",
+    "browser": "Browsers: sign out of important sites everywhere and change those passwords",
+}
+PERSIST_CHECK = ("~/.bashrc, ~/.zshrc, ~/.profile", "crontab -l", "~/.config/systemd/user (Linux), ~/Library/LaunchAgents (macOS)",
+                 "~/.claude/settings.json hooks, ~/.cursor/mcp.json, ~/.codex/config.toml", "~/.npmrc, pip config, ~/.gitconfig",
+                 "your editor's extensions")
+
+
+def remediation(findings, ctx: dict) -> list[str]:
+    """Concrete next steps for a NOT SAFE (or UNCLEAR) result, in the order they matter."""
+    v = verdict(findings)
+    if v == "PASS":
+        return []
+    serious = [f for f in findings if f.severity in ("critical", "high")]
+    text = " ".join(f"{f.title} {f.detail}" for f in serious)
+    steps: list[str] = []
+    if not ctx.get("local"):
+        if v == "FAIL":
+            steps.append("Nothing was run on your machine: this came from reading its files." if ctx.get("network") == "not run"
+                         else "It ran only inside the sandbox: your real files and keys were not exposed by this check.")
+            steps.append("Don't install it. If you already did, run `honeyrun <that project dir> --installed` and follow the steps it gives.")
+            if any(f.rule in ("known-malware", "canary-exfil", "bait-read", "persistence", "mcp-tool-poisoning") for f in serious):
+                steps.append("Report it so others are protected: rerun with --abuse-report report.txt and paste it into the form it names.")
+        else:
+            steps.append("Read the findings above. If they don't match what this project says it does, don't install it.")
+        return steps
+    # It was found on this machine: assume it already ran here.
+    if v == "FAIL":
+        steps.append("Stop using it now: remove the flagged package (`npm uninstall <name>` / `pip uninstall <name>`) "
+                     "or delete the flagged entry from the agent config shown above, then restart that agent or editor.")
+        keys = [msg for k, msg in ROTATE.items() if k.lower() in text.lower()]
+        steps.append("Assume what it could read is exposed. Rotate, from a clean device if you can: " +
+                     ("; ".join(keys) if keys else "SSH keys, cloud keys, registry tokens, AI API keys, browser sessions") + ".")
+        steps.append("Look for anything it left behind: " + "; ".join(PERSIST_CHECK) + ".")
+        steps.append("If it touched work systems, tell your security team now and keep the honeyrun report as evidence.")
+    else:
+        steps.append("Check each flagged entry: you should recognise it and know why it runs. Remove what you don't.")
+    return steps

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -10,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, bait, detect, installed, report, review, static
+from . import __version__, bait, detect, history, installed, intel, report, review, sources, static
 from .analyze import SEVERITIES, Finding, analyze, scrub
 from .sandbox import SandboxError, ensure_image, pick_runtime, run_job
 
@@ -72,7 +73,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="honeyrun",
         description="Install and run an untrusted repo in a sandbox full of fake credentials, "
                     "then report what it opened, ran and tried to send.")
-    ap.add_argument("target", nargs="?", help="GitHub URL, owner/repo, any git URL, or a local directory")
+    ap.add_argument("target", nargs="?",
+                    help="owner/repo, any git URL (GitHub, GitLab, Bitbucket, Codeberg, self-hosted), npm:NAME[@VER], "
+                         "pypi:NAME[==VER], a local directory, or an archive (.tgz .zip .whl .vsix .crate)")
     ap.add_argument("--ref", help="branch or tag to clone")
     ap.add_argument("--subdir", help="run from this subdirectory of the repo (monorepos)")
     ap.add_argument("--network", choices=("offline", "open"), default="offline",
@@ -88,6 +91,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="sandbox engine. auto picks the strongest available: Apple container (a VM per sandbox), "
                          "then Docker or Podman with gVisor, then Docker Desktop's VM, then rootless Podman")
     ap.add_argument("--runtime", choices=("auto", "runsc", "krun", "runc"), default="auto")
+    ap.add_argument("--deep", action="store_true",
+                    help="more passes: once more as if inside CI, and three runs in a row (catches payloads that "
+                         "wait for CI secrets or for the Nth run)")
+    ap.add_argument("--no-history", action="store_true",
+                    help="don't compare with or remember past checks of this target (kept locally, fingerprints only)")
+    ap.add_argument("--intel", action=argparse.BooleanOptionalAction, default=None,
+                    help="look the target up in OSV (known malware and vulnerabilities) and GitHub (advisories, "
+                         "open security issues, unmerged fixes). Default: on for public targets, off for local dirs")
     ap.add_argument("--no-later", action="store_true",
                     help="skip the extra pass with the clock 45 days ahead (catches time bombs)")
     ap.add_argument("--installed", action="store_true",
@@ -125,7 +136,14 @@ def main(argv: list[str] | None = None) -> int:
     trace: dict[str, bytes] = {}
     runtime_label = "none (static scan only)"
     try:
-        src, label, cleanup = fetch(args.target, args.ref)
+        pkg, public = None, True
+        if sources.is_package_spec(args.target):
+            src, label, cleanup, pkg = sources.fetch_package(args.target)
+        elif sources.is_archive(Path(args.target).expanduser()):
+            src, label, cleanup = sources.fetch_archive(Path(args.target).expanduser())
+            public = False   # a local file: don't tell anyone its name
+        else:
+            src, label, cleanup = fetch(args.target, args.ref)
         if args.subdir:
             sub = (src / args.subdir).resolve()
             if not sub.is_dir() or (sub != src.resolve() and src.resolve() not in sub.parents):
@@ -137,7 +155,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.agent_configs:
             pre += _guard("agent-configs", installed.scan_agent_configs)
         plan = detect.plan(src, args.network, args.install, args.run, args.install_timeout,
-                           args.run_timeout, args.mcp, later=not args.no_later)
+                           args.run_timeout, args.mcp, later=not args.no_later,
+                           **({"deep": True} if args.deep else {}))
+        use_intel = args.intel if args.intel is not None else (public and cleanup is not None)
+        if use_intel:
+            pre += _guard("intel", _intel, label, pkg or _manifest_identity(src, plan.ecosystem))
         baits = bait.generate()
         if not args.static_only and not args.installed:
             runtime = pick_runtime(args.runtime, args.allow_runc, args.engine)
@@ -161,14 +183,50 @@ def main(argv: list[str] | None = None) -> int:
             (out / name.lstrip("_")).write_bytes(data)
 
     result = analyze(trace, baits, args.network)
-    result.findings = sorted(result.findings + pre,
-                             key=lambda f: (-SEVERITIES.index(f.severity), f.rule, f.title))
+    result.findings = result.findings + pre
+    if not args.no_history:
+        snap = history.snapshot(label, report.verdict(result.findings), result.findings, result.hosts,
+                                result.tools, plan.lifecycle)
+        past = history.load(label)
+        if past and (trace or not past[-1].get("tools")):
+            result.findings += history.compare(past[-1], snap)
+            snap["verdict"] = report.verdict(result.findings)
+        history.save(label, snap)
+    result.findings.sort(key=lambda f: (-SEVERITIES.index(f.severity), f.rule, f.title))
 
     manifest = next((m for m in ("package.json", "pyproject.toml", "setup.py") if (Path(src) / m).is_file()), "") \
         if not cleanup else ""
     ctx = {"target": label, "runtime": runtime_label, "network": args.network if trace else "not run",
-           "baits": len(baits) if trace else 0, "mcp": plan.mcp and bool(trace), "manifest": manifest}
+           "baits": len(baits) if trace else 0, "mcp": plan.mcp and bool(trace), "manifest": manifest,
+           "local": bool(args.installed)}
     return _finish(args, result, ctx)
+
+
+def _manifest_identity(src: Path, ecosystem: str) -> dict | None:
+    """Name and version a registry would know this repo by, for OSV."""
+    try:
+        if ecosystem == "node":
+            meta = json.loads((src / "package.json").read_text())
+            if isinstance(meta, dict) and isinstance(meta.get("name"), str):
+                return {"ecosystem": "npm", "name": meta["name"], "version": str(meta.get("version") or "")}
+        if ecosystem == "python":
+            import tomllib
+            proj = (tomllib.loads((src / "pyproject.toml").read_text()).get("project") or {})
+            if isinstance(proj.get("name"), str):
+                return {"ecosystem": "PyPI", "name": proj["name"], "version": str(proj.get("version") or "")}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _intel(label: str, ident: dict | None) -> list[Finding]:
+    out: list[Finding] = []
+    if ident:
+        out += intel.osv(ident["ecosystem"], ident["name"], ident.get("version", ""))
+    gh = intel.github_repo(label)
+    if gh:
+        out += intel.github(*gh)
+    return out
 
 
 def _agent_configs(args) -> int:
@@ -177,7 +235,7 @@ def _agent_configs(args) -> int:
     result.findings.sort(key=lambda f: (-SEVERITIES.index(f.severity), f.rule, f.title))
     args.verbose = True
     ctx = {"target": "agent configs on this machine", "runtime": "none (read-only check)", "network": "not run",
-           "baits": 0, "mcp": False, "manifest": "",
+           "baits": 0, "mcp": False, "manifest": "", "local": True,
            "advice": {"FAIL": "Remove or replace the flagged entries in your agent configs.",
                       "WARN": "Check the flagged entries; each one runs when your agent starts.",
                       "PASS": "Nothing risky in what your agents start. Check unfamiliar servers with honeyrun <package>."}}
@@ -193,6 +251,9 @@ def _finish(args, result, ctx) -> int:
         report.agent(result, ctx, note)
     else:
         report.terminal(result, ctx, show_info=args.verbose)
+        steps = report.remediation(result.findings, ctx)
+        if steps:
+            print("\nWhat to do now:\n" + "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1)))
         if note:
             print("\nAI review (advisory, does not change the exit code):\n" + report.note_text(note))
     if args.json:

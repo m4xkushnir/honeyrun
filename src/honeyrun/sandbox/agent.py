@@ -39,7 +39,7 @@ WORK = "/workspace/repo"
 SYSCALLS = (
     "execve,execveat,clone,clone3,fork,vfork,open,openat,openat2,creat,"
     "connect,sendto,sendmsg,sendmmsg,bind,listen,"
-    "memfd_create,ptrace,unshare,setns,mount,init_module,finit_module"
+    "memfd_create,socket,ptrace,unshare,setns,mount,init_module,finit_module"
 )
 # Paths that change on every install and say nothing about the code: counted, not listed.
 NOISE = (f"{HOME}/.npm/", f"{HOME}/.cache/", "/tmp/pip-", "/tmp/npm-", "/tmp/node-compile-cache",
@@ -329,6 +329,52 @@ def start_sinkhole(netlog, mint):
         threading.Thread(target=target, args=args, daemon=True).start()
 
 
+def agent_socket(path, kind, netlog):
+    """A decoy ssh-agent / gpg-agent socket: anything that connects is after the user's keys.
+
+    World-connectable (the workload runs as another user), accepts, records, never answers."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    os.chmod(path, 0o666)
+    srv.listen(8)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                time.sleep(0.1)
+                continue
+            netlog.write(kind="agent-socket", sock=kind)
+            conn.settimeout(1)
+            try:
+                conn.recv(256)
+            except OSError:
+                pass
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+
+def start_agent_sockets(netlog):
+    """Returns the env vars that point the workload at the decoys."""
+    env = {}
+    if not os.path.isdir(PUB):
+        return env
+    try:
+        ssh, gpg = f"{PUB}/ssh-agent.sock", f"{PUB}/S.gpg-agent"
+        agent_socket(ssh, "ssh", netlog)
+        agent_socket(gpg, "gpg", netlog)
+        env = {"SSH_AUTH_SOCK": ssh, "GPG_AGENT_INFO": f"{gpg}:0:1"}
+    except OSError as e:
+        log(f"decoy agent sockets: {e}")
+    return env
+
+
 # ---------------------------------------------------------------- processes
 
 def runner_pids(uid):
@@ -501,6 +547,9 @@ def run_phase(phase, env, uid):
     is_mcp = bool(phase.get("mcp"))
     out = open(f"{TRACE}/{name}.log", "wb")
     shifted = False
+    if isinstance(phase.get("env"), dict):
+        # per-phase conditions (CI variables) layered over the job environment
+        env = {**env, **{str(k): v for k, v in phase["env"].items() if isinstance(v, str)}}
     if phase.get("clock"):
         # Time bombs: the same code again with the clock moved forward (libfaketime).
         lib = next(iter(sorted(glob.glob("/usr/lib/*/faketime/libfaketime.so.1"))), None)
@@ -547,7 +596,7 @@ def run_phase(phase, env, uid):
     if probe:
         probe.done.wait(2)
     res = {
-        "name": name, "cmd": phase["cmd"], "exit": proc.returncode,
+        "name": name, "cmd": phase["cmd"], "exit": proc.returncode, "t0": round(started, 3), "t1": round(time.time(), 3),
         "seconds": round(time.time() - started, 2), "timed_out": timed_out,
         "lingering": lingering, "evidence_truncated": truncated,
     }
@@ -722,6 +771,7 @@ def main():
         "NPM_CONFIG_UPDATE_NOTIFIER": "false", "NPM_CONFIG_FUND": "false", "NPM_CONFIG_AUDIT": "false",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_BREAK_SYSTEM_PACKAGES": "1",
     }
+    env.update(start_agent_sockets(netlog))
     env.update(job.get("env", {}))
     if mint.ok:   # offline only: make the workload trust the sinkhole CA
         bundle = f"{PUB}/ca-bundle.crt"

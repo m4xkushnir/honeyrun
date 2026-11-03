@@ -39,6 +39,9 @@ def main() -> int:
         for key in ("install", "run"):
             if key in exp:
                 cmd += [f"--{key}", exp[key]]
+        if exp.get("deep"):
+            cmd.append("--deep")
+        cmd += ["--no-history", "--no-intel"]   # each fixture run must stand on its own
         t0 = time.time()
         proc = subprocess.run(cmd, capture_output=True, text=True)
         secs = time.time() - t0
@@ -88,7 +91,7 @@ def real(args, out: Path) -> int:
             continue
         repo, _, sub = line.partition(" ")
         name = (repo + "_" + sub).strip("_").replace("/", "_")
-        cmd = [sys.executable, "-m", "honeyrun", repo, "--network", "open", "--runtime", args.runtime,
+        cmd = [sys.executable, "-m", "honeyrun", repo, "--network", "open", "--runtime", args.runtime, "--no-history", "--no-intel",
                "--json", str(out / f"real-{name}.json"), "--run-timeout", "20", "-v"]
         if sub:
             cmd += ["--subdir", sub]

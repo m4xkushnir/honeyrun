@@ -14,7 +14,7 @@ import re
 import tomllib
 from pathlib import Path
 
-from . import deobf
+from . import artifacts, deobf
 from .analyze import HIDDEN_CHARS, STRONG_INJECTION, Finding
 
 # Only dirs that are huge and never hold the repo's own config. build/dist/vendor/.tox are still walked
@@ -244,12 +244,18 @@ def _files(root: Path, state: dict | None = None):
         for p in entries:
             try:
                 if p.is_symlink():
+                    # never followed: only recorded, so the target can be judged as text
+                    if state is not None and len(state.setdefault("symlinks", [])) < 500:
+                        state["symlinks"].append(p)
                     continue
                 isdir, isfile = p.is_dir(), p.is_file()
             except OSError:
                 continue
             if isdir:
-                if p.name not in SKIP_DIRS:
+                if p.name == "__pycache__":
+                    if state is not None and len(state.setdefault("pycache", [])) < 300:
+                        state["pycache"].append(p)
+                elif p.name not in SKIP_DIRS:
                     stack.append(p)
             elif isfile:
                 n += 1
@@ -343,7 +349,370 @@ def _hook_files(repo: Path) -> set[str]:
     return out
 
 
+# ---------------------------------------------------------------- rare install-time and config vectors
+
+_URL_RE = re.compile(r"(https?|git\+\w+|ssh|ftp)://([^/\s:@'\"]*@)?(\[[0-9a-f:]+\]|[^/\s:'\"?#]+)", re.I)
+_IPV4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def _url_risk(url: str, ok_hosts: tuple[str, ...] = ()) -> str | None:
+    """None for an expected host, 'high' for plain http or a raw IP, else 'medium'."""
+    m = _URL_RE.match(url.strip().strip("'\""))
+    if not m:
+        return None
+    host = m.group(3).lower().strip("[]")
+    if host in ok_hosts or any(host.endswith("." + h) for h in ok_hosts):
+        return None
+    if m.group(1).lower() == "http" or _IPV4.match(host) or ":" in host:
+        return "high"
+    return "medium"
+
+
+NPM_HOSTS = ("registry.npmjs.org", "registry.yarnpkg.com", "npm.pkg.github.com")
+PYPI_HOSTS = ("pypi.org", "pypi.python.org", "files.pythonhosted.org")
+_NPMRC_KEYS = re.compile(r"^\s*(script-shell|node-options|ignore-scripts|(?:@[\w.-]+:)?registry)\s*=\s*(.*?)\s*$", re.I | re.M)
+_PIP_OPT = re.compile(r"^[ \t]*(?:--)?(index-url|extra-index-url|trusted-host|-i)[ \t]*[= ][ \t]*(\S+)", re.I | re.M)
+_PIP_OPT_REQ = re.compile(r"^[ \t]*(--index-url|--extra-index-url|--trusted-host|-i)[ \t=]+(\S+)", re.I | re.M)
+
+
+def _pkg_config(r: str, name: str, text: str, add) -> None:
+    low = name.lower()
+    if low == ".npmrc":
+        for m in _NPMRC_KEYS.finditer(text):
+            key, val = m.group(1).lower(), m.group(2).strip("'\"")
+            if key == "ignore-scripts":
+                if val.lower() == "false":
+                    add("medium", "pkg-config", r + key, f"{r} turns install scripts back on (ignore-scripts=false)", m.group(0).strip())
+            elif key.endswith("registry"):
+                risk = _url_risk(val, NPM_HOSTS)
+                if risk:
+                    add(risk, "pkg-config", r + key + val, f"{r} points npm at a non-default registry", m.group(0).strip())
+            else:
+                add("medium", "pkg-config", r + key, f"{r} sets {key}, which changes what npm install runs", m.group(0).strip())
+    elif low == ".yarnrc.yml":
+        m_yp = re.search(r"^\s*yarnPath\s*:\s*['\"]?([^\s'\"#]+)", text, re.M)
+        if m_yp:
+            # Yarn Berry repos pin their yarn under .yarn/releases/ by design; anywhere else is unusual.
+            usual = re.fullmatch(r"\.yarn/releases/yarn-[\w.-]+\.c?js", m_yp.group(1).lstrip("./"))
+            add("info" if usual else "medium", "pkg-config", r + "yarnPath",
+                f"{r} runs a repo-supplied yarn (yarnPath)", m_yp.group(1))
+        if re.search(r"^\s*plugins\s*:", text, re.M):
+            add("medium", "pkg-config", r + "plugins", f"{r} loads yarn plugins (repo code runs on every yarn command)", "plugins:")
+        for m in re.finditer(r"^\s*npmRegistryServer\s*:\s*(\S+)", text, re.M):
+            risk = _url_risk(m.group(1), NPM_HOSTS)
+            if risk:
+                add(risk, "pkg-config", r + "reg", f"{r} points yarn at a non-default registry", m.group(0).strip())
+    elif low == ".yarnrc":
+        if re.search(r"^\s*yarn-path\b", text, re.M):
+            add("medium", "pkg-config", r + "yarn-path", f"{r} runs a repo-supplied yarn (yarn-path)", "yarn-path")
+    elif low in (".pnpmfile.cjs", ".pnpmfile.mjs", "pnpmfile.js"):
+        add("medium", "pkg-config", r, f"{r} runs repo code at every pnpm install", "pnpm hooks can rewrite any dependency")
+    else:
+        if low == "pyproject.toml" and not re.search(r"^\[+tool\.(pip|uv)\b", text, re.M):
+            return
+        rx = _PIP_OPT_REQ if low.startswith("requirements") and low.endswith(".txt") else _PIP_OPT
+        if low.endswith(".txt") and not low.startswith("requirements"):
+            return
+        for m in rx.finditer(text):
+            key, val = m.group(1).lower().lstrip("-"), m.group(2).strip("'\",")
+            if key == "trusted-host":
+                add("high" if _IPV4.match(val.split(":")[0]) else "medium", "pkg-config", r + key + val,
+                    f"{r} disables TLS checking for a package host (trusted-host)", m.group(0).strip())
+            else:
+                risk = _url_risk(val, PYPI_HOSTS)
+                if risk:
+                    add(risk, "pkg-config", r + key + val, f"{r} installs Python packages from a non-PyPI index", m.group(0).strip())
+
+
+_FETCH_EXEC = re.compile(r"(curl|wget)[^|;&\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b|/dev/(tcp|udp)/|base64\s+(-d|--decode)|"
+                         r"powershell|Invoke-Expression|\bnc\s+-[a-z]*e\b", re.I)
+_DEV_NET = re.compile(r"\b(curl|wget)\b|urlopen\(|urllib\.request|requests\.(get|post|put)\(|http\.client|"
+                      r"socket\.create_connection|Invoke-WebRequest|\bnc\s|aiohttp\.ClientSession|httpx\.(get|post)\(")
+_RS_RISK = re.compile(r"TcpStream|UdpSocket|reqwest::|ureq::|curl::|Command::new\(\s*\"(?:curl|wget|sh|bash|powershell|pwsh)\"|"
+                      r"include_bytes!\(\s*\"[^\"]*\.(?:bin|exe|so|dll|dylib|dat|node|wasm|elf)\"")
+
+
+def _make_default_target(text: str) -> str:
+    out, seen = [], False
+    for ln in text.splitlines():
+        if not seen:
+            if re.match(r"^[A-Za-z0-9_][^\s:=#]*(\s+[^\s:=#]+)*\s*:(?![=:])", ln) and not ln.startswith("."):
+                seen = True
+                out.append(ln.split(":", 1)[1])
+            continue
+        if ln.startswith(("\t", " ")) or not ln.strip():
+            out.append(ln)
+        elif not ln.lstrip().startswith("#"):
+            break
+    return "\n".join(out)
+
+
+def _dev_autorun(r: str, p: Path, name: str, text: str, add) -> None:
+    low = name.lower()
+    if low in ("conftest.py", "noxfile.py", "tasks.py") or low in ("makefile", "gnumakefile"):
+        body = _make_default_target(text) if low in ("makefile", "gnumakefile") else text
+        when = {"conftest.py": "pytest imports it on every test run", "noxfile.py": "runs on every nox command",
+                "tasks.py": "runs on every invoke command"}.get(low, "the default make target runs it")
+        if _FETCH_EXEC.search(body):
+            add("high", "dev-autorun", r, f"{r} fetches and runs code ({when})", _FETCH_EXEC.search(body).group(0)[:120])
+        elif _DEV_NET.search(body):
+            add("medium", "dev-autorun", r, f"{r} talks to the network ({when})", _DEV_NET.search(body).group(0)[:120])
+    elif low == "build.rs":
+        m = _RS_RISK.search(text)
+        if m:
+            add("medium", "dev-autorun", r, f"{r} does network work, runs a downloader or shell, or embeds a binary at cargo build",
+                m.group(0)[:120])
+    elif low.endswith(".go"):
+        for m in re.finditer(r"^[ \t]*//go:generate[ \t]+(.+)$", text, re.M):
+            cmd = m.group(1)
+            if re.search(r"\b(curl|wget)\b", cmd) or re.match(r"(sh|bash|zsh|powershell|pwsh)\b", cmd):
+                add("medium", "dev-autorun", r + cmd[:40], f"{r} has a go:generate line that runs a downloader or shell", cmd[:150])
+    elif low in ("gradle-wrapper.properties", "maven-wrapper.properties"):
+        gradle = low.startswith("gradle")
+        jar = p.parent / ("gradle-wrapper.jar" if gradle else "maven-wrapper.jar")
+        if not jar.is_file():
+            return
+        ok = ("services.gradle.org", "downloads.gradle.org") if gradle else ("repo.maven.apache.org", "repo1.maven.org")
+        for m in re.finditer(r"^\s*(distributionUrl|wrapperUrl)\s*=\s*(\S+)", text, re.M):
+            url = m.group(2).replace("\\:", ":")
+            if _url_risk(url, ok):
+                add("medium", "dev-autorun", r, f"{r} fetches the build tool from a non-standard host and a wrapper jar runs it",
+                    m.group(1) + "=" + url[:150])
+
+
+SHADOWED = {"ls", "cat", "sh", "bash", "zsh", "git", "npm", "npx", "node", "python", "python3", "pip", "pip3", "sudo", "ssh",
+            "curl", "wget", "docker", "kubectl", "code", "claude", "codex", "gemini", "cursor"}
+_DEP_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "overrides", "resolutions",
+                 "pnpm")
+
+
+def _dep_values(obj, depth=0):
+    """(name, spec) pairs from a dependency table, descending into nested overrides."""
+    if depth > 4 or not isinstance(obj, dict):
+        return
+    for k, v in obj.items():
+        if isinstance(v, str):
+            yield str(k), v
+        elif isinstance(v, dict):
+            yield from _dep_values(v, depth + 1)
+
+
+def _package_json_checks(r: str, pkg: dict, add) -> None:
+    bins = pkg.get("bin")
+    names = []
+    if isinstance(bins, str) and isinstance(pkg.get("name"), str):
+        names = [pkg["name"].rsplit("/", 1)[-1]]
+    elif isinstance(bins, dict):
+        names = [str(k) for k in bins]
+    for n in names:
+        if n in SHADOWED:
+            add("high", "bin-shadow", r + n, f"{r} installs a command named '{n}' that shadows the real one",
+                f"bin: {n}")
+    n_dep = 0
+    for sect in _DEP_SECTIONS:
+        for dep, spec in _dep_values(pkg.get(sect)):
+            n_dep += 1
+            if n_dep > 400:
+                return
+            s = spec.strip()
+            if re.match(r"(git\+|git://|github:|gitlab:|bitbucket:|file:|link:|https?://)", s, re.I) or re.search(r"\.t(ar\.)?gz$", s):
+                risk = _url_risk(s)
+                sev = "medium" if (s.lower().startswith("http://") or risk == "high") else "info"
+                add(sev, "dep-source", r + dep, f"{r} installs '{dep}' from outside the registry", f"{dep}: {s[:150]}")
+            elif (dep.startswith("@") or re.search(r"internal|corp|private", dep, re.I)) and re.match(r"^[\^~>=v\s]*(99|999|9999|99999)(\.\d+){0,2}", s):
+                add("info", "dep-confusion", r + dep, f"{r} pins '{dep}' to version {s}, a dependency-confusion pattern", f"{dep}: {s}")
+
+
+def _workflow_check(r: str, text: str, add) -> None:
+    body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    if not re.search(r"\b(pull_request_target|workflow_run)\b", body):
+        return
+    if not re.search(r"checkout", body):
+        return
+    m = re.search(r"github\.event\.pull_request\.head\.(sha|ref|repo[\w.]*)|github\.head_ref|"
+                  r"github\.event\.workflow_run\.head_(sha|branch|repository[\w.]*)|refs/pull/[^\s'\"]*/(merge|head)", body)
+    if m:
+        add("medium", "ci-untrusted-checkout", r, "CI workflow runs untrusted PR code with repository secrets",
+            f"{r}: privileged trigger plus checkout of {m.group(0)}; a risk to the repo's own users and maintainers")
+
+
+# files that mention telemetry SDKs by dependency name
+_TEL_EXACT = {"posthog", "posthog-js", "posthog-node", "analytics-node", "analytics-python", "segment-analytics-python",
+              "mixpanel", "mixpanel-browser", "amplitude", "amplitude-js", "sentry-sdk", "raven", "datadog", "ddtrace",
+              "dd-trace", "newrelic", "applicationinsights", "opencensus-ext-azure", "logrocket", "hotjar", "react-ga",
+              "react-ga4", "google-analytics", "gtag", "ga-gtag", "vue-gtag", "plausible-tracker", "plausible",
+              "heap-api", "heapanalytics", "bugsnag", "rollbar", "honeybadger", "firebase-analytics", "rudder-sdk-js",
+              "rudder-sdk-node", "rudderstack", "@vercel/analytics", "@vercel/speed-insights"}
+_TEL_PREFIX = ("@sentry/", "@segment/", "@datadog/", "@amplitude/", "@bugsnag/", "@honeybadger-io/", "@rudderstack/",
+               "@plausible", "@firebase/analytics", "@hotjar/", "@newrelic/", "@microsoft/applicationinsights",
+               "@posthog/", "@mixpanel/", "@logrocket/")
+_MCP_DEPS = {"@modelcontextprotocol/sdk", "mcp", "fastmcp"}
+_PRIVACY_FILE = re.compile(r"^(privacy|terms|data[-_ ]collection|telemetry)([-_ ].*)?$", re.I)
+_PRIVACY_HEAD = re.compile(r"^#{1,6}[ \t].*\b(privacy|telemetry|data collection|analytics)\b", re.I | re.M)
+OPTOUT = re.compile(r"\bDO_NOT_TRACK\b|\b[A-Z][A-Z0-9_]{1,40}_(?:NO_TELEMETRY|TELEMETRY_(?:DISABLED?|OPT_?OUT|OFF)|"
+                    r"DISABLE_TELEMETRY|DISABLE_ANALYTICS|ANALYTICS_DISABLED)\b|\bDISABLE_TELEMETRY\b|\bNO_TELEMETRY\b")
+
+
+def _tel(dep: str) -> bool:
+    d = dep.lower().replace("_", "-")
+    return d in _TEL_EXACT or d.startswith(_TEL_PREFIX)
+
+
+def _py_dep_names(lines) -> set[str]:
+    out = set()
+    for ln in lines:
+        m = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", ln) if isinstance(ln, str) else None
+        if m:
+            out.add(m.group(1).lower().replace("_", "-"))
+    return out
+
+
+def _collect_deps(r: str, name: str, text: str, pkg, ctx: dict) -> None:
+    low = name.lower()
+    if low == "package.json" and isinstance(pkg, dict):
+        for sect in ("dependencies", "optionalDependencies", "peerDependencies"):
+            if isinstance(pkg.get(sect), dict):
+                ctx["deps"] |= {str(k) for k in pkg[sect]}
+    elif low.startswith("requirements") and low.endswith(".txt") and not re.search(r"dev|test|doc|lint", low):
+        ctx["deps"] |= _py_dep_names(text.splitlines())
+    elif low == "pyproject.toml":
+        try:
+            data = tomllib.loads(text)
+        except (ValueError, RecursionError):
+            return
+        proj = data.get("project") if isinstance(data.get("project"), dict) else {}
+        if isinstance(proj.get("dependencies"), list):
+            ctx["deps"] |= _py_dep_names(proj["dependencies"])
+        opt = proj.get("optional-dependencies")
+        for k, v in opt.items() if isinstance(opt, dict) else []:
+            if isinstance(v, list) and not re.search(r"dev|test|doc|lint", str(k)):
+                ctx["deps"] |= _py_dep_names(v)
+        poetry = ((data.get("tool") or {}).get("poetry") or {}) if isinstance(data.get("tool"), dict) else {}
+        if isinstance(poetry.get("dependencies"), dict):
+            ctx["deps"] |= {str(k).lower() for k in poetry["dependencies"]}
+
+
+# ---------------------------------------------------------------- obfuscated JavaScript
+
+_OBF_HEX_IDS = re.compile(r"\b_0x[0-9a-f]{4,6}\b")
+_OBF_STRARRAY = re.compile(r"\b(?:var|let|const)\s+_0x[0-9a-f]{3,6}\s*=\s*\[\s*['\"]")
+_OBF_ESCAPES = re.compile(r"(?:\\x[0-9a-fA-F]{2}){40,}")
+_OBF_CHARCODES = re.compile(r"fromCharCode\s*\(\s*(?:\d+\s*,\s*){29,}\d+")
+_OBF_JSFUCK = re.compile(r"[\[\]()+!]{200,}")
+
+
+def obfuscation(text: str) -> str | None:
+    """Short name of the obfuscation scheme found in JavaScript source, or None."""
+    n = len(_OBF_HEX_IDS.findall(text))
+    if n >= 20:
+        return f"javascript-obfuscator style identifiers ({n} _0x names)"
+    if _OBF_STRARRAY.search(text) and re.search(r"\(function\s*\(\s*_0x[0-9a-f]+\s*,\s*_0x[0-9a-f]+", text):
+        return "string-array with rotation function"
+    if _OBF_ESCAPES.search(text):
+        return "long \\x escape run"
+    if _OBF_CHARCODES.search(text):
+        return "String.fromCharCode chain of 30+ numbers"
+    if _OBF_JSFUCK.search(text):
+        return "JSFuck-style symbol run"
+    return None
+
+
+_IMG_REF = re.compile(r"['\"`]([\w./@ -]*?([\w-]+\.(?:png|jpe?g|gif|webp|bmp|ico)))['\"`]", re.I)
+_EVALISH = re.compile(r"(?<![.\w])eval\s*\(|new\s+Function\s*\(|(?<![.\w])Function\s*\(|(?<![.\w])exec\s*\(|vm\.run\w+\(")
+_READS_FILE = re.compile(r"readFileSync|readFile\s*\(|createReadStream|\bopen\s*\(|Path\([^)]*\)\.read_bytes|read_bytes\(|__file__|__filename")
+COMPILED_EXT = {".pyc", ".so", ".node", ".dll", ".exe", ".jar", ".dylib", ".pyd"}
+
+
+def _hook_refs(repo: Path) -> tuple[set[str], set[str]]:
+    """(files an install hook names, files package.json main/bin names). Any extension: a hook can run a .node or .jar."""
+    refs: set[str] = set()
+    entries: set[str] = set()
+    tok = re.compile(r"[\w./@+-]+\.[A-Za-z0-9]{1,6}\b")
+
+    def put(dest: set, t: str):
+        n = safe_rel(t[2:] if t.startswith("./") else t)
+        if n:
+            dest.add(n)
+
+    pkg = _json(repo / "package.json")
+    if isinstance(pkg, dict):
+        scripts = pkg.get("scripts")
+        for hook in LIFECYCLE:
+            cmd = scripts.get(hook) if isinstance(scripts, dict) else None
+            if isinstance(cmd, str):
+                for t in tok.findall(cmd):
+                    put(refs, t)
+        if isinstance(pkg.get("main"), str):
+            put(entries, pkg["main"])
+        b = pkg.get("bin")
+        for v in ([b] if isinstance(b, str) else list(b.values()) if isinstance(b, dict) else []):
+            if isinstance(v, str):
+                put(entries, v)
+    setup = _read(repo / "setup.py")
+    for t in re.findall(r"['\"]([\w./-]+\.[A-Za-z0-9]{1,6})['\"]", setup):
+        put(refs, t)
+    return refs, entries
+
+
 RANK = {"critical": 3, "high": 2, "medium": 1, "info": 0}
+
+
+def _post(repo: Path, state: dict, ctx: dict, loaders, images: dict, scanner, add) -> None:
+    """Checks that need the whole walk: symlinks, orphaned bytecode, steganography loaders, telemetry, budget."""
+    root = os.path.realpath(repo)
+    for p in state.get("symlinks", []):
+        r = str(p.relative_to(repo))
+        try:
+            tgt = os.readlink(p)
+        except OSError:
+            continue
+        if os.path.isabs(tgt):
+            norm = os.path.normpath(tgt)
+            outside = not (norm == root or norm.startswith(root + os.sep) or norm == str(repo) or norm.startswith(str(repo) + os.sep))
+        elif tgt.startswith("~"):
+            norm, outside = tgt, True
+        else:
+            norm = os.path.normpath(os.path.join(os.path.dirname(r), tgt))
+            outside = norm == ".." or norm.startswith(".." + os.sep)
+        if not outside:
+            continue
+        cred = _CRED_LINK.search(tgt) or _CRED_LINK.search(norm)
+        add("high" if cred else "medium", "symlink-escape", r,
+            f"symlink {r} points outside the repo" + (" at a credential or system path" if cred else ""),
+            f"{r} -> {tgt}", file=r)
+    for d in state.get("pycache", []):
+        try:
+            pycs = [x.name for x in d.iterdir() if x.name.endswith(".pyc")]
+        except OSError:
+            continue
+        orphans = [n for n in pycs if not (d.parent / (n.split(".")[0] + ".py")).exists()]
+        if orphans:
+            rd = str(d.relative_to(repo))
+            add("medium", "compiled-python", rd, f"{rd} holds compiled Python with no matching source",
+                ", ".join(orphans[:4]), file=rd)
+    for r, names in loaders:
+        hit = sorted(n for n in names if n in images)
+        if hit:
+            add("high", "image-loader", r, f"{r} reads {hit[0]} and runs code (possible steganography loader)",
+                f"image {images[hit[0]]} is named in a file that reads files and calls eval/exec/Function", file=r)
+    sdks = sorted(d for d in ctx["deps"] if _tel(d))
+    if sdks:
+        add("info", "data-sharing", "sdks", "sends data to third parties: " + ", ".join(sdks[:12]), "telemetry or error-reporting SDKs in dependencies", file="")
+        if not ctx["policy"]:
+            agent = ctx["plugin"] or bool(ctx["deps"] & _MCP_DEPS)
+            add("medium" if agent else "info", "privacy-policy", "nopolicy", "no privacy policy found",
+                ("this MCP server or agent plugin sees your conversations and files, and ships telemetry SDKs without saying what it sends"
+                 if agent else "telemetry SDKs are present but there is no PRIVACY or TERMS file or privacy section in the README"), file="")
+    if ctx["optouts"]:
+        add("info", "telemetry-optout", "optout", "telemetry can be disabled with " + ", ".join(sorted(ctx["optouts"])[:5]), "", file="")
+    if scanner.budget.incomplete:
+        add("medium", "scan-incomplete", "artifact-budget",
+            "artifact scan incomplete: the 300 MB read budget ran out, some archives, binaries or images were not inspected",
+            "", file="")
+
+
+_CRED_LINK = re.compile(r"\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.netrc|\.npmrc|\.config\b|id_rsa|id_ed25519|credentials|"
+                        r"/etc(?:/|$)|/proc(?:/|$)|Keychains|\.git-credentials|\.env\b|~$", re.I)
 
 
 def scan(repo: Path) -> list[Finding]:
@@ -352,6 +721,15 @@ def scan(repo: Path) -> list[Finding]:
         hooked = _hook_files(repo)
     except Exception:
         hooked = {"setup.py"}
+    try:
+        refs, entries = _hook_refs(repo)
+    except Exception:
+        refs, entries = set(), set()
+    scanner = artifacts.Scanner(refs | hooked, entries)
+    # telemetry / privacy facts gathered while walking, judged once at the end
+    ctx: dict = {"deps": set(), "policy": False, "optouts": set(), "plugin": False}
+    loaders: list[tuple[str, set[str]]] = []   # code that reads files and evals, with the images it names
+    images: dict[str, str] = {}                # image basename -> repo path
     cur = [""]
 
     def add(sev, rule, key, title, detail="", file=None):
@@ -384,6 +762,51 @@ def scan(repo: Path) -> list[Finding]:
         if size > MAX_BYTES and _is_watched(r, name):
             add("medium", "scan-incomplete", r, f"{r} is too large to inspect ({size} bytes)", r)
             return
+
+        depth = r.count("/")
+        low = name.lower()
+        if low in (".npmrc", ".yarnrc.yml", ".yarnrc", ".pnpmfile.cjs", ".pnpmfile.mjs", "pnpmfile.js", "pip.conf", "setup.cfg",
+                   "pyproject.toml") or (low.startswith("requirements") and low.endswith(".txt")):
+            text = _read(p)
+            _pkg_config(r, name, text, add)
+            if low == "pyproject.toml" or low.startswith("requirements"):
+                _collect_deps(r, name, text, None, ctx)
+        if low in ("conftest.py", "noxfile.py", "tasks.py", "makefile", "gnumakefile", "build.rs",
+                   "gradle-wrapper.properties", "maven-wrapper.properties") or low.endswith(".go"):
+            if not (low.endswith(".go") and bulky):
+                _dev_autorun(r, p, name, _read(p), add)
+        if low.endswith((".yml", ".yaml")) and r.startswith(".github/workflows/"):
+            _workflow_check(r, _read(p), add)
+        if r.startswith(".claude-plugin/"):
+            ctx["plugin"] = True
+        if depth <= 2 and _PRIVACY_FILE.match(p.stem) and p.suffix.lower() in ("", ".md", ".txt", ".html", ".rst"):
+            ctx["policy"] = True
+        if depth <= 1 and low.startswith("readme"):
+            rd = _read(p)
+            if _PRIVACY_HEAD.search(rd):
+                ctx["policy"] = True
+            ctx["optouts"] |= set(OPTOUT.findall(rd))
+        if low == "package.json" and depth <= 2:
+            pj = _json(p)
+            if isinstance(pj, dict):
+                _package_json_checks(r, pj, add)
+                _collect_deps(r, name, "", pj, ctx)
+        if p.suffix.lower() == ".pyc":
+            add("medium", "compiled-python", r, f"{r} is compiled Python committed without its source",
+                "bytecode hides what the code does; ask for the .py source")
+        if p.suffix.lower() in COMPILED_EXT and (r in refs):
+            add("high", "compiled-hook", r, f"{r} is a compiled file run or loaded by an install hook",
+                "install hooks should run readable scripts, not binaries or bytecode")
+        if p.suffix.lower() in artifacts.IMG_EXT:
+            images.setdefault(p.name, r)
+        if p.suffix.lower() in (".js", ".mjs", ".cjs") and (not name.endswith(".min.js") or r in refs or r in entries):
+            named = r in refs or r in entries
+            js = _read(p) if size <= MAX_BYTES else ""
+            if js:
+                why = obfuscation(js)
+                if why:
+                    add("medium" if named else "info", "obfuscated-js", r,
+                        f"{r} is obfuscated JavaScript" + (" run by an install hook or entry point" if named else ""), why)
 
         # ---- package managers: code that runs at install
         if name == "package.json":
@@ -527,6 +950,12 @@ def scan(repo: Path) -> list[Finding]:
                 add("medium", "trojan-source", r, f"{r} contains bidirectional control characters", r)
             elif HIDDEN_CHARS.search(text):
                 add("info", "trojan-source", r, f"{r} contains invisible Unicode characters", r)
+            ctx["optouts"] |= set(OPTOUT.findall(text))
+            if p.suffix in (".js", ".mjs", ".cjs", ".ts", ".py") and len(loaders) < 300 and _EVALISH.search(text) \
+                    and _READS_FILE.search(text):
+                names = {m.group(2) for m in _IMG_REF.finditer(text)}
+                if names:
+                    loaders.append((r, names))
             hit = source_injection(text) if p.suffix in (".js", ".mjs", ".cjs", ".ts", ".py") else None
             if hit:
                 add(hit[1], "agent-instructions", r, f"{r} contains text aimed at an AI model (tool description injection)", hit[0])
@@ -550,16 +979,33 @@ def scan(repo: Path) -> list[Finding]:
                 readable = deobf._decode(blob.group(0)) is not None
                 add("medium" if readable else "info", "encoded-blob", r, f"{r} embeds a large encoded blob", r)
 
+    def artifact(p: Path):
+        if not scanner.wants(p.name):
+            return
+        try:
+            size = p.stat().st_size
+        except OSError:
+            return
+        r = rel(p)
+        cur[0] = r
+        for h in scanner.scan_file(p, r, size):
+            add(h.severity, h.rule, h.key, h.title, h.detail, file=r)
+
     state: dict = {}
     for p in _files(repo, state):
         try:
             one(p)
+            artifact(p)
         except Exception:  # a hostile file must never abort the scan
             try:
                 r = rel(p)
             except ValueError:
                 r = p.name
             add("info", "scan-error", "err:" + r, f"could not parse {r}", r, file=r)
+    try:
+        _post(repo, state, ctx, loaders, images, scanner, add)
+    except Exception:
+        add("info", "scan-error", "post", "could not finish the artifact and privacy checks", "", file="")
     if state.get("truncated"):
         add("medium", "scan-incomplete", "max-files", f"scan incomplete: more than {MAX_FILES} files, the rest were not read", "", file="")
 

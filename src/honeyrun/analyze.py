@@ -52,6 +52,17 @@ PROBE_PATTERNS = [
         (r"/\.(bash|zsh)_history$", "shell history"),
         (r"/\.gnupg/", "GPG keyring"),
         (r"/\.password-store/|/\.local/share/keyrings/", "password store"),
+        # chat and dev apps keep live session tokens in plain files
+        (r"/\.config/(discord|Slack|Signal|Element)/|/\.local/share/TelegramDesktop/|/Local Storage/leveldb", "chat app session store"),
+        (r"/\.steam/.*ssfn|/ssfn\d+$", "Steam session"),
+        (r"/\.config/filezilla/|/FileZilla/(recentservers|sitemanager)\.xml$", "FileZilla saved logins"),
+        (r"/\.config/gcloud/", "Google Cloud credentials"),
+        (r"/\.azure/", "Azure credentials"),
+        (r"/\.config/doctl/", "DigitalOcean token"),
+        (r"/\.terraform\.d/credentials\.tfrc\.json$", "Terraform Cloud token"),
+        (r"/\.vault-token$", "Vault token"),
+        (r"/\.config/hub$", "hub (GitHub) token"),
+        (r"\.kdbx$", "KeePass database"),
     )
 ]
 
@@ -96,7 +107,31 @@ STRONG_INJECTION = [re.compile(p, re.I) for p in (
 )]
 HIDDEN_CHARS = re.compile("[​-‏‪-‮⁠-⁤﻿\U000e0000-\U000e007f]")
 # probe labels whose patterns can legitimately match files inside a repo (test fixtures, bundled profiles)
-REPO_NOISY = {"browser credential store", "MetaMask extension storage", "crypto wallet", "browser profile"}
+REPO_NOISY = {"browser credential store", "MetaMask extension storage", "crypto wallet", "browser profile",
+              "chat app session store", "KeePass database"}
+# commands that, planted earlier in PATH, run instead of the real tool
+COMMON_CMDS = ("git", "ssh", "sudo", "npm", "node", "python", "python3", "pip", "curl", "ls", "docker", "kubectl",
+               "claude", "codex", "gemini", "code")
+SHADOW_PATH = re.compile(rf"^{HOME}/(\.local/bin|bin)/({'|'.join(COMMON_CMDS)})$")
+HOOKS_PATH = re.compile(rf"/\.git/hooks/|^{HOME}/(\.config/git|\.git-templates?|\.githooks?)/")
+INPUT_DEV = re.compile(r"^/dev/(input/|uinput$)")
+SCREEN_TOOLS = {"xinput", "xdotool", "xclip", "xsel", "wl-copy", "wl-paste", "pbcopy", "pbpaste", "scrot",
+                "gnome-screenshot", "import", "screencapture", "grim"}
+SELF_SCRIPT = re.compile(r"^(pre|post)?(install|setup|prepare|bootstrap|hook)[\w.-]*\.(js|mjs|cjs|py|sh)$", re.I)
+HISTORY = re.compile(r"/\.(bash|zsh|python|node_repl|sh)_history$|/\.zsh_sessions/")
+HISTORY_WIPE = re.compile(r"\b(rm|shred|truncate|unlink)\b[^;|&]*_history|>\s*\S*_history|\bhistory\s+-[cw]\b")
+# cloud instance metadata: where a cloud VM hands out its role credentials
+IMDS_ADDR = {"169.254.169.254", "fd00:ec2::254", "100.100.100.200", "169.254.170.2"}
+IMDS_NAME = re.compile(r"(^|\.)(metadata\.google\.internal|metadata\.goog|metadata\.azure\.com|metadata\.tencentyun\.com|"
+                       r"instance-data)(\.|$)|169\.254\.169\.254|fd00:ec2")
+# pastes, webhooks, file drops and tunnels: the usual places stolen data is dropped
+EXFIL_SERVICE = re.compile(
+    r"(^|\.)(pastebin\.com|paste\.ee|hastebin\.com|hastebin\.skyra\.pw|ghostbin\.\w+|transfer\.sh|file\.io|0x0\.st|"
+    r"discord\.com|discordapp\.com|api\.telegram\.org|hooks\.slack\.com|webhook\.site|requestbin\.(com|net)|"
+    r"requestcatcher\.com|pipedream\.net|ngrok\.io|ngrok-free\.app|ngrok\.app|ngrok\.dev|trycloudflare\.com|"
+    r"serveo\.net|loca\.lt|interact\.sh|burpcollaborator\.net|oast\.(pro|live|site|online|fun|me)|onion(\.\w+)?)(\.|$)")
+AGENT_SOCKS = ("/run/honeyrun/ssh-agent", "/run/honeyrun/S.gpg-agent")
+FORK_BOMB = 300
 PROC_ENVIRON = re.compile(r"^/proc/(self|thread-self|\d+)/environ$")
 PROC_FOREIGN = re.compile(r"^/proc/(\d+)/(root|cwd|mem|maps)(/|$)")
 # untrusted text must never reach a terminal or a Markdown table raw
@@ -203,6 +238,12 @@ class Finding:
 
 
 def parse_dns_query(pkt: bytes) -> str | None:
+    q = parse_dns_question(pkt)
+    return q[0] if q else None
+
+
+def parse_dns_question(pkt: bytes) -> tuple[str, int] | None:
+    """(name, qtype) of a single-question DNS query."""
     if len(pkt) < 17 or pkt[2] & 0x80 or int.from_bytes(pkt[4:6], "big") != 1:
         return None
     labels, off = [], 12
@@ -210,7 +251,9 @@ def parse_dns_query(pkt: bytes) -> str | None:
         n = pkt[off]
         if n == 0:
             name = ".".join(labels)
-            return name if name and all(32 < ord(c) < 127 for c in name) else None
+            if not (name and all(32 < ord(c) < 127 for c in name)) or len(pkt) < off + 3:
+                return None
+            return name, int.from_bytes(pkt[off + 1:off + 3], "big")
         if n > 63:
             return None
         labels.append(pkt[off + 1:off + 1 + n].decode("ascii", "replace"))
@@ -219,6 +262,12 @@ def parse_dns_query(pkt: bytes) -> str | None:
 
 
 def parse_strace(raw: str, phase: str) -> list[Event]:
+    return parse_strace_counted(raw, phase)[0]
+
+
+def parse_strace_counted(raw: str, phase: str) -> tuple[list[Event], int]:
+    """Events plus the number of processes (not threads) the phase created."""
+    spawned = 0
     procs: dict[int, Proc] = {}
     pending: dict[int, tuple[str, str]] = {}
     events: list[Event] = []
@@ -254,6 +303,7 @@ def parse_strace(raw: str, phase: str) -> list[Event]:
 
         if name in ("clone", "clone3", "fork", "vfork") and ok and ret.isdigit():
             child = int(ret)
+            spawned += "CLONE_THREAD" not in args
             procs[child] = Proc(child, p.exe, list(p.argv), pid)
         elif name in ("execve", "execveat") and strings:
             path = text(strings[0])
@@ -274,7 +324,10 @@ def parse_strace(raw: str, phase: str) -> list[Event]:
                 path = os.path.join(cwd, path)
             path = norm(path)
             write = name == "creat" or bool(re.search(r"O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND", args))
-            events.append(Event(phase, "open", pid, p, {"path": path, "write": write, "ok": ok, "err": err}))
+            events.append(Event(phase, "open", pid, p, {"path": path, "write": write, "ok": ok, "err": err,
+                                                         "trunc": name == "creat" or "O_TRUNC" in args}))
+        elif name == "socket" and (("AF_PACKET" in args) or (re.search(r"AF_INET6?\b", args) and "SOCK_RAW" in args)):
+            events.append(Event(phase, "rawsock", pid, p, {"args": args[:60], "ok": ok}))
         elif name == "connect":
             fam = "unix" if "AF_UNIX" in args else "inet6" if "AF_INET6" in args else "inet" if "AF_INET" in args else None
             if not fam:
@@ -297,12 +350,29 @@ def parse_strace(raw: str, phase: str) -> list[Event]:
             dport = int(port.group(1)) if port else None
             for s in strings:
                 buf = unhex(s)
-                q = parse_dns_query(buf) if (dport == 53 or dport is None) else None
+                q = parse_dns_question(buf) if (dport == 53 or dport is None) else None
                 if q:
-                    events.append(Event(phase, "dns", pid, p, {"qname": q}))
+                    events.append(Event(phase, "dns", pid, p, {"qname": q[0], "qtype": q[1]}))
                 elif buf:
                     events.append(Event(phase, "send", pid, p, {"buf": buf, "port": dport}))
-    return events
+    return events, spawned
+
+
+# A credential sent to the service it belongs to is how package managers work (npm sends the
+# ~/.npmrc token to the npm registry on every install). Anywhere else it is theft.
+OWN_SERVICE = {
+    "npm token": ("registry.npmjs.org", "registry.yarnpkg.com"),
+    "git credential": ("github.com", "codeload.github.com"),
+    "GitHub CLI token": ("github.com", "api.github.com"),
+    "GITHUB_TOKEN env": ("github.com", "api.github.com", "uploads.github.com"),
+    "Docker registry auth": ("index.docker.io", "registry-1.docker.io", "auth.docker.io"),
+}
+
+
+def _own_service(label: str, where: str) -> bool:
+    m = re.match(r"^[A-Z]+ https?://([^/:\s]+)", where)
+    host = (m.group(1) if m else "").lower()
+    return any(host == h or host.endswith("." + h) for h in OWN_SERVICE.get(label, ()))
 
 
 def host_expected(host: str) -> bool:
@@ -342,9 +412,22 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
     meta = json.loads(trace.get("meta.json", b"{}") or b"{}")
     phases = meta.get("phases", [])
     events: list[Event] = []
+    spawned: dict[str, int] = {}
     for ph in phases:
         raw = trace.get(f"{ph['name']}.strace", b"").decode("utf-8", "replace")
-        events += parse_strace(raw, ph["name"])
+        evs, spawned[ph["name"]] = parse_strace_counted(raw, ph["name"])
+        events += evs
+
+    def phase_at(t) -> str:
+        """The sinkhole logs wall-clock times; the agent records when each phase ran."""
+        if isinstance(t, (int, float)) and not isinstance(t, bool):
+            # exact containment first: adjacent phases would otherwise both claim the slack at their edges
+            for slack in (0.0, 1.5):
+                for ph in phases:
+                    t0, t1 = ph.get("t0"), ph.get("t1")
+                    if isinstance(t0, (int, float)) and isinstance(t1, (int, float)) and t0 <= t <= t1 + slack:
+                        return ph["name"]
+        return "?"
 
     findings: dict[tuple, Finding] = {}
 
@@ -379,6 +462,28 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             else:
                 add("high", "bait-read", rel, f"{b.label} opened: {rel}", f"by {ev.proc.label()}", ev.phase)
             continue
+        if INPUT_DEV.match(path):
+            add("high", "input-capture", path, "opens keyboard/input devices (keylogging or keystroke injection)",
+                f"{path} by {ev.proc.label()}", ev.phase)
+            continue
+        if ev.data["write"]:
+            sm = SHADOW_PATH.match(path)
+            if sm:
+                add("high", "path-shadow", path, f"puts a fake {sm.group(2)} earlier in PATH: {path.replace(HOME, '~')}",
+                    f"by {ev.proc.label()}", ev.phase)
+                continue
+            if path == "/etc/ld.so.preload":
+                add("high", "loader-hijack", path, "writes /etc/ld.so.preload (injects a library into every program)",
+                    f"by {ev.proc.label()}", ev.phase)
+                continue
+            if HOOKS_PATH.search(path) and not path.startswith(WORK + "/repo/.git/"):
+                add("high", "hook-hijack", path, f"writes a git hook outside the repository: {path.replace(HOME, '~')}",
+                    f"by {ev.proc.label()}", ev.phase)
+                continue
+            if HISTORY.search(path) and ev.data.get("trunc"):
+                add("medium", "anti-forensics", path, "deletes its own traces (truncates shell history)",
+                    f"{path.replace(HOME, '~')} by {ev.proc.label()}", ev.phase)
+                continue
         pm = PROC_FOREIGN.match(path)
         if pm and int(pm.group(1)) != ev.proc.pid:
             add("high", "credential-probe", f"proc-{pm.group(2)}", f"inspects another process via /proc/{pm.group(1)}/{pm.group(2)}",
@@ -424,10 +529,20 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             for decoded in payloads(joined)[:1]:
                 add("info", "decoded-payload", decoded[:30], "decoded the inline payload", decoded[:300], ev.phase)
         name0 = argv[0] if argv else ""
-        if ev.data["ok"] and (name0.startswith("[") or (DISGUISE.match(os.path.basename(name0) or base)
+        # an interpreter that renames itself in argv[0] (python as "systemd") is hiding in `ps`
+        renamed = bool(name0) and os.path.basename(name0) != base and not DISGUISE.match(base) \
+            and bool(DISGUISE.match(os.path.basename(name0)))
+        if ev.data["ok"] and (name0.startswith("[") or renamed or (DISGUISE.match(os.path.basename(name0) or base)
                                                        and not ev.data["path"].startswith(("/usr/", "/bin/", "/sbin/", "/lib")))):
             add("high", "disguised-process", name0[:40] or base,
                 f"runs a process disguised as a system process: {name0[:40] or base}", f"{ev.data['path']} {joined[:120]}", ev.phase)
+        if ev.data["ok"] and base in SCREEN_TOOLS:
+            add("medium", "input-capture", base, "reads or writes the clipboard / screen", joined[:160], ev.phase)
+        if script and re.search(r"LD_PRELOAD\s*=|ld\.so\.preload", script) \
+                and re.search(r"(\.bashrc|\.profile|\.zshrc|\.bash_profile|ld\.so\.preload|/etc/environment)", script):
+            add("high", "loader-hijack", "ldpreload-" + script[:30], "persists an LD_PRELOAD library", script[:160], ev.phase)
+        if script and HISTORY_WIPE.search(script) or (base in ("rm", "shred", "truncate") and any(HISTORY.search(a) for a in argv[1:])):
+            add("medium", "anti-forensics", "history-" + base, "deletes its own traces (shell history)", joined[:160], ev.phase)
         if MINER.search(joined):
             add("high", "crypto-miner", base, "starts a cryptocurrency miner", joined[:160], ev.phase)
         if re.match(r"^(/proc/self/fd/|/proc/\d+/fd/|/dev/shm/|/memfd:|/run/user/)", ev.data["path"]):
@@ -448,6 +563,9 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             else:
                 add(ESCAPE_SYSCALLS[call], "escape-attempt", call, f"calls {call}() (namespace, mount or kernel primitive)",
                     f"{ev.data['args']} by {ev.proc.label()}", ev.phase)
+        elif ev.kind == "rawsock":
+            add("high", "raw-socket", "rawsock", "opens a raw/packet socket (ICMP or custom-protocol channel)",
+                f"{ev.data['args']} by {ev.proc.label()}" + ("" if ev.data["ok"] else " (blocked)"), ev.phase)
         elif ev.kind == "bind" and ev.phase == "install" and not ev.data["addr"].startswith(("127.", "::1")):
             add("medium", "listener", str(ev.data["port"]), f"opens a listening port {ev.data['port']} during install",
                 f"by {ev.proc.label()}", ev.phase)
@@ -469,6 +587,15 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             d = ev.data
             if d["family"] == "unix" and "docker.sock" in d["addr"]:
                 add("high", "docker-socket", "docker.sock", "tries to reach the Docker socket", d["addr"], ev.phase)
+            elif d["family"] == "unix" and d["addr"].startswith(AGENT_SOCKS):
+                gpg = "gpg" in d["addr"]
+                add("high", "agent-hijack", "gpg" if gpg else "ssh",
+                    "talks to your GPG agent (could sign or decrypt as you)" if gpg
+                    else "talks to your SSH agent (could sign in to your servers)", d["addr"], ev.phase)
+            elif d["family"] != "unix" and d["addr"] in IMDS_ADDR:
+                # offline the connect fails; the attempt is the signal
+                add("high", "imds", "imds", "tries to read cloud instance credentials (IMDS)",
+                    f"{d['addr']}:{d['port']} by {ev.proc.label()}", ev.phase)
             elif d["family"] != "unix" and d["port"] != 53 and is_remote_ip(d["addr"]) and network == "offline":
                 note_host(f"{d['addr']}:{d['port']}", ev.phase, "direct-ip", ev.proc)
 
@@ -479,7 +606,7 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         except ValueError:
             continue
         if rec.get("kind") == "dns":
-            note_host(rec["qname"].lower().rstrip("."), "?", "dns")
+            note_host(rec["qname"].lower().rstrip("."), phase_at(rec.get("t")), "dns")
         elif rec.get("kind") == "tcp":
             payload = base64.b64decode(rec.get("data_b64", ""))
             host = rec.get("host") or rec.get("sni") or f"127.0.0.1:{rec['port']}"
@@ -487,10 +614,41 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             proto = "https" if rec.get("sni") is not None or payload[:1] == b"\x16" else "http"
             where = (f"{rec.get('method', '')} {proto}://{host}{rec.get('path', '')}".strip()
                      if rec.get("method") or proto == "http" else f"TLS to {host} (handshake refused, body not seen)")
-            note_host(host.lower(), "?", proto)
+            rec_phase = phase_at(rec.get("t"))
+            note_host(host.lower(), rec_phase, proto)
             hosts[host.lower()]["requests"] = hosts[host.lower()].get("requests", []) + [where]
-            egress.append((where, payload, ""))
+            egress.append((where, payload, "" if rec_phase == "?" else rec_phase))
 
+    for ph_name, n in spawned.items():
+        if n > FORK_BOMB:
+            add("high", "fork-bomb", ph_name, "spawns hundreds of processes (fork bomb or resource abuse)",
+                f"{n} processes in {ph_name}", ph_name)
+    for ev in (e for e in events if e.kind == "dns" and e.data.get("qtype") == 16):
+        n = ev.data["qname"].lower().rstrip(".")
+        if not host_expected(n):
+            add("medium", "dns-txt", n, "DNS TXT lookup (a common command-and-control channel)", n, ev.phase)
+    for line in trace.get("net.jsonl", b"").decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("kind") == "dns" and rec.get("qtype") == 16 and isinstance(rec.get("qname"), str) \
+                and not host_expected(rec["qname"].lower().rstrip(".")):
+            n = rec["qname"].lower().rstrip(".")
+            add("medium", "dns-txt", n, "DNS TXT lookup (a common command-and-control channel)", n, phase_at(rec.get("t")))
+        elif rec.get("kind") == "agent-socket":
+            add("high", "agent-hijack", str(rec.get("sock")), "talks to your SSH agent (could sign in to your servers)"
+                if rec.get("sock") != "gpg" else "talks to your GPG agent (could sign or decrypt as you)",
+                "connected to the decoy agent socket", phase_at(rec.get("t")))
+    for name in hosts:
+        seen_in = ",".join(sorted(x for x in hosts[name]["phases"] if x != "?"))
+        if IMDS_NAME.search(name):
+            add("high", "imds", "imds", "tries to read cloud instance credentials (IMDS)", name, seen_in)
+        if EXFIL_SERVICE.search(name.split(":")[0]):
+            add("high", "exfil-service", name, "sends to a paste/webhook/tunnel service often used for exfiltration",
+                name, seen_in)
     for name in hosts:
         if MINER.search(name):
             add("high", "crypto-miner", name, f"contacts a mining pool {name}", "", ",".join(sorted(hosts[name]["phases"])))
@@ -537,6 +695,9 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                 if where.startswith("its own output"):
                     add("high", "secret-in-output", b.label, f"prints {b.label} to its output",
                         f"{where}: anything that logs this run (CI) now holds the secret", phase)
+                elif _own_service(b.label, where):
+                    add("info", "credential-to-own-service", b.label,
+                        f"{b.label} was sent to its own service (normal for an install)", where, phase)
                 else:
                     add("critical", "canary-exfil", b.label, f"{b.label} left the sandbox", where, phase)
 
@@ -623,6 +784,12 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
     # -------------------------------------------------- filesystem changes (before/after snapshot)
     files = json.loads(trace.get("files.json", b"{}") or b"{}")
     bait_paths = set(bait_by_path)
+    # files the workload ran: the binary itself and script arguments such as `node scripts/setup.js`
+    executed: set[str] = set()
+    for ev in execs:
+        for a in [ev.data["path"], *ev.data["argv"][1:4]]:
+            if a and not a.startswith("-") and len(a) < 300:
+                executed.add(norm(a if a.startswith("/") else os.path.join(WORK, "repo", a)))
     outside: list[str] = []
     for kind in ("created", "modified", "deleted"):
         for path, size, mode, head in files.get(kind, []):
@@ -630,6 +797,29 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             if path in bait_paths:
                 add("high", "bait-tamper", path, f"{'deletes' if kind == 'deleted' else 'modifies'} credential file {short}",
                     kind)
+                continue
+            if kind != "deleted":
+                sm = SHADOW_PATH.match(path)
+                if sm:
+                    add("high", "path-shadow", path, f"puts a fake {sm.group(2)} earlier in PATH: {short}", f"{kind} file")
+                    continue
+                if path == "/etc/ld.so.preload" or (HOOKS_PATH.search(path) and not path.startswith(WORK + "/repo/.git/")
+                                                    and not path.startswith(WORK + "/")):
+                    rule, what = (("loader-hijack", "writes /etc/ld.so.preload") if path.startswith("/etc/")
+                                  else ("hook-hijack", "writes a git hook outside the repository"))
+                    add("high", rule, path, f"{what}: {short}", f"{kind} file")
+                    continue
+                if re.search(r"\.so(\.\d+)*$", path) and path.startswith(HOME + "/") \
+                        and not re.search(r"/site-packages/|/\.cache/|/\.npm/|/node_modules/", path):
+                    add("high" if head in EXECUTABLE_MAGIC else "medium", "loader-hijack", path,
+                        f"drops a shared library in the home directory: {short}", f"{kind} file ({size} bytes)")
+            if kind == "deleted" and HISTORY.search(path):
+                add("medium", "anti-forensics", path, f"deletes its own traces ({short})", "shell history removed")
+                continue
+            if kind == "deleted" and path.startswith(WORK + "/") and (
+                    path in executed or SELF_SCRIPT.search(os.path.basename(path)) or "/.husky/" in path):
+                add("medium", "anti-forensics", path, f"deletes its own traces ({path.replace(WORK + '/repo/', '')})",
+                    "a script that ran during the phases was removed afterwards")
                 continue
             persist = next((label for rx, label in PERSISTENCE if rx.search(path)), None)
             if persist and kind != "deleted":
@@ -684,6 +874,15 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
               and f.rule != "incomplete"]:
         add("high", "delayed-activation", f.rule + f.title,
             f"only acts when the clock is 45 days ahead: {f.title}", f.detail, f.phase)
+
+    # Deep mode replays the last phase under CI variables and three times in a row.
+    for f in [f for f in findings.values() if f.phase and f.severity != "info" and f.rule != "incomplete"]:
+        in_phases = set(f.phase.split(","))
+        if in_phases == {"ci"}:
+            add("high", "ci-triggered", f.rule + f.title, f"only acts inside CI (targets CI secrets): {f.title}", f.detail, f.phase)
+        elif in_phases == {"repeat"}:
+            add("high", "delayed-activation", "repeat" + f.rule + f.title,
+                f"only acts after repeated runs: {f.title}", f.detail, f.phase)
 
     out = sorted(findings.values(), key=lambda f: (-SEVERITIES.index(f.severity), f.rule, f.title))
     return Analysis(out, sorted(hosts.values(), key=lambda h: h["host"]), len(seen_pids), files_opened, tools, phases,

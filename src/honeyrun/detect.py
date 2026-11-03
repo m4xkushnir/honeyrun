@@ -10,6 +10,8 @@ from pathlib import Path
 
 MCP_NODE_DEPS = {"@modelcontextprotocol/sdk", "fastmcp", "mcp-framework"}
 MCP_PY_DEPS = re.compile(r"^\s*['\"]?(mcp|fastmcp)\b", re.I)
+CI_ENV = {"CI": "true", "GITHUB_ACTIONS": "true", "GITHUB_WORKFLOW": "build", "RUNNER_OS": "Linux"}
+REPEATS = 3
 LATER_CLOCK = "+45d"   # far enough for "activate after N days" checks, near enough to look plausible
 LIFECYCLE = ("preinstall", "install", "postinstall", "prepare", "prepublish")
 
@@ -112,7 +114,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
 
 
 def plan(repo: Path, network: str, install: str | None, run: str | None,
-         install_timeout: int, run_timeout: int, mcp: bool | None = None, later: bool = True) -> Plan:
+         install_timeout: int, run_timeout: int, mcp: bool | None = None, later: bool = True, deep: bool = False) -> Plan:
     p = Plan()
     offline = network == "offline"
     auto_install = auto_run = None
@@ -131,6 +133,7 @@ def plan(repo: Path, network: str, install: str | None, run: str | None,
         p.phases.append({"name": "install", "cmd": install, "timeout": install_timeout})
     if run:
         p.phases.append({"name": "run", "cmd": run, "timeout": run_timeout, "mcp": p.mcp})
+    base_last = p.phases[-1] if p.phases else None
     if later and p.phases:
         last = p.phases[-1]
         hooks = bool(p.lifecycle) or (repo / "setup.py").exists() or (install is not None and install != auto_install)
@@ -140,4 +143,9 @@ def plan(repo: Path, network: str, install: str | None, run: str | None,
                              "timeout": min(install_timeout, 180)})
         p.phases.append({**last, "name": "later", "clock": LATER_CLOCK,
                          "timeout": min(last["timeout"], run_timeout)})
+    if deep and base_last:
+        # Some payloads wake up only in CI, or only on the second or third run.
+        p.phases.append({**base_last, "name": "ci", "env": dict(CI_ENV), "timeout": min(base_last["timeout"], run_timeout)})
+        p.phases.append({"name": "repeat", "cmd": f"for i in {' '.join(map(str, range(1, REPEATS + 1)))}; do {base_last['cmd']}; done",
+                         "timeout": min(base_last["timeout"] * 2, run_timeout * 2), "mcp": False})
     return p
