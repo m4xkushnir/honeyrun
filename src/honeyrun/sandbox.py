@@ -24,25 +24,28 @@ class SandboxError(RuntimeError):
 
 @dataclass
 class Runtime:
-    name: str      # value for --runtime
-    label: str     # what the report says about the isolation boundary
+    name: str               # value for --runtime ("" = the engine's default)
+    label: str              # what the report says about the isolation boundary
+    engine: str = "docker"  # docker | podman | container (Apple)
 
 
-def _docker(*args: str, **kw) -> subprocess.CompletedProcess:
-    if not shutil.which("docker"):
-        raise SandboxError("docker is not installed or not on PATH")
-    return subprocess.run(["docker", *args], capture_output=True, **kw)
+ENGINES = ("docker", "podman", "container")
 
 
-def pick_runtime(requested: str, allow_runc: bool) -> Runtime:
-    info = _docker("info", "--format", "{{json .}}", text=True)
+def _cli(engine: str, *args: str, **kw) -> subprocess.CompletedProcess:
+    if not shutil.which(engine):
+        raise SandboxError(f"{engine} is not installed or not on PATH")
+    return subprocess.run([engine, *args], capture_output=True, **kw)
+
+
+def _docker_runtime(requested: str, allow_runc: bool) -> Runtime:
+    info = _cli("docker", "info", "--format", "{{json .}}", text=True)
     if info.returncode != 0:
         lines = info.stderr.strip().splitlines()
         raise SandboxError("cannot reach the Docker daemon" + (f": {lines[-1]}" if lines else ""))
     data = json.loads(info.stdout or "{}")
     runtimes = set((data.get("Runtimes") or {}).keys())
     desktop = "Docker Desktop" in (data.get("OperatingSystem") or "")
-
     if requested in ("auto", "runsc") and "runsc" in runtimes:
         return Runtime("runsc", "gVisor (runsc)")
     if requested == "runsc":
@@ -52,8 +55,60 @@ def pick_runtime(requested: str, allow_runc: bool) -> Runtime:
     if allow_runc or requested == "runc":
         return Runtime("runc", "runc on the host kernel (weaker: no gVisor)")
     raise SandboxError(
-        "gVisor (runsc) is not installed. Install it (https://gvisor.dev/docs/user_guide/install/) "
-        "or pass --allow-runc to accept plain container isolation on the host kernel.")
+        "gVisor (runsc) is not installed. Install it (https://gvisor.dev/docs/user_guide/install/), "
+        "use --engine podman (rootless), or pass --allow-runc to accept plain container isolation.")
+
+
+def _podman_runtime(requested: str, allow_runc: bool) -> Runtime:
+    info = _cli("podman", "info", "--format", "json", text=True)
+    if info.returncode != 0:
+        raise SandboxError("podman is installed but not working: " + info.stderr.strip()[-300:])
+    data = json.loads(info.stdout or "{}")
+    rootless = bool(((data.get("host") or {}).get("security") or {}).get("rootless"))
+    runsc, krun = shutil.which("runsc"), shutil.which("krun")
+    if requested in ("auto", "runsc") and runsc:
+        return Runtime(runsc, "gVisor (runsc) via podman", "podman")
+    if requested == "runsc":
+        raise SandboxError("runsc is not on PATH for podman to use")
+    if requested in ("auto", "krun") and krun:
+        return Runtime("krun", "libkrun microVM via podman", "podman")
+    if rootless:
+        return Runtime("", "rootless podman (user namespace, no gVisor)", "podman")
+    if allow_runc or requested == "runc":
+        return Runtime("", "podman on the host kernel (weaker: no gVisor)", "podman")
+    raise SandboxError("rootful podman without gVisor or krun: run podman rootless, install runsc, or pass --allow-runc")
+
+
+def _apple_runtime() -> Runtime:
+    res = _cli("container", "system", "status", text=True)
+    if res.returncode != 0:
+        raise SandboxError("Apple container is installed but not running: run `container system start`")
+    return Runtime("", "Apple container (a lightweight VM per sandbox)", "container")
+
+
+def pick_runtime(requested: str, allow_runc: bool, engine: str = "auto") -> Runtime:
+    """Strongest boundary available: a VM per sandbox, then gVisor, then a desktop VM, then rootless."""
+    if engine == "docker":
+        return _docker_runtime(requested, allow_runc)
+    if engine == "podman":
+        return _podman_runtime(requested, allow_runc)
+    if engine == "container":
+        return _apple_runtime()
+    errors = []
+    for name, fn in (("container", _apple_runtime),
+                     ("docker", lambda: _docker_runtime(requested, allow_runc)),
+                     ("podman", lambda: _podman_runtime(requested, allow_runc))):
+        if not shutil.which(name):
+            continue
+        try:
+            return fn()
+        except SandboxError as e:
+            errors.append(str(e))
+    if errors:
+        raise SandboxError("; ".join(errors))
+    raise SandboxError(
+        "no sandbox engine found. Install one of: Docker (with gVisor on Linux), Podman (rootless, no daemon), "
+        "or Apple container on macOS 26+. Or run with --static-only, which needs none.")
 
 
 def _sandbox_dir() -> Path:
@@ -67,13 +122,13 @@ def image_tag() -> str:
     return f"honeyrun-sandbox:{h.hexdigest()[:12]}"
 
 
-def ensure_image(quiet: bool = False) -> str:
+def ensure_image(quiet: bool = False, engine: str = "docker") -> str:
     tag = image_tag()
-    if _docker("image", "inspect", tag).returncode == 0:
+    if _cli(engine, "image", "inspect", tag).returncode == 0:
         return tag
     if not quiet:
         print(f"building sandbox image {tag} (first run only)...", flush=True)
-    res = _docker("build", "-t", tag, str(_sandbox_dir()), text=True)
+    res = _cli(engine, "build", "-t", tag, str(_sandbox_dir()), text=True)
     if res.returncode != 0:
         raise SandboxError("image build failed:\n" + res.stderr[-2000:])
     return tag
@@ -161,9 +216,11 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
             memory: str = "2g", cpus: str = "2") -> dict[str, bytes]:
     name = f"honeyrun-{uuid.uuid4().hex[:10]}"
     tmp = Path(tempfile.mkdtemp(prefix="honeyrun-"))
+    if runtime.engine == "container":
+        return _run_apple(src, job, runtime, image, timeout, memory, cpus, name)
     args = [
         "run", "--rm", "-i", "--name", name,
-        "--runtime", runtime.name,
+        *(["--runtime", runtime.name] if runtime.name else []),
         "--hostname", "devbox",
         "--read-only",
         "--cap-drop", "ALL",
@@ -187,15 +244,37 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
         args += ["--tmpfs", "/run/honeyrun:rw,size=4m,mode=0755"]
         args += ["--network", "none", "-v", f"{tmp / 'resolv.conf'}:/etc/resolv.conf:ro"]
     else:
-        args += ["--network", "bridge"]
+        if runtime.engine == "docker":
+            args += ["--network", "bridge"]    # podman picks the right default for rootless itself
     args.append(image)
+    return _execute(runtime.engine, args, name, job, src, timeout, tmp)
+
+
+def _run_apple(src, job, runtime, image, timeout, memory, cpus, name) -> dict[str, bytes]:
+    """Apple container: every sandbox is its own VM, so the VM is the boundary and the
+    container-level knobs Docker needs (pids, seccomp, tmpfs sizes) do not exist there."""
+    tmp = Path(tempfile.mkdtemp(prefix="honeyrun-"))
+    args = ["run", "--rm", "-i", "--name", name, "--memory", memory, "--cpus", cpus, "--read-only",
+            "--cap-drop", "ALL",
+            "--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "DAC_READ_SEARCH",
+            "--cap-add", "SYS_PTRACE", "--cap-add", "KILL", "--cap-add", "NET_BIND_SERVICE"]
+    for path in ("/workspace", "/home/runner", "/tmp", "/trace", "/trace-meta", "/run/honeyrun"):
+        args += ["--tmpfs", path]
+    if job["network"] == "offline":
+        (tmp / "resolv.conf").write_text("nameserver 127.0.0.1\noptions attempts:1 timeout:1\n")
+        args += ["--network", "none", "-v", f"{tmp / 'resolv.conf'}:/etc/resolv.conf:ro"]
+    args.append(image)
+    return _execute("container", args, name, job, src, timeout, tmp)
+
+
+def _execute(engine, args, name, job, src, timeout, tmp) -> dict[str, bytes]:
 
     payload = json.dumps(job).encode() + b"\n" + pack(src)
     out_f = tempfile.NamedTemporaryFile(prefix="honeyrun-trace-", delete=False)
     err_f = tempfile.NamedTemporaryFile(prefix="honeyrun-err-", delete=False)
     try:
         try:
-            _run_container(args, name, payload, out_f, err_f, timeout)
+            _run_container(engine, args, name, payload, out_f, err_f, timeout)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         out_f.flush()
@@ -220,8 +299,8 @@ def _tail(path: str, n: int = 1 << 20) -> bytes:
         return f.read()
 
 
-def _run_container(args, name, payload, out_f, err_f, timeout) -> None:
-    proc = subprocess.Popen(["docker", *args], stdin=subprocess.PIPE, stdout=out_f, stderr=err_f)
+def _run_container(engine, args, name, payload, out_f, err_f, timeout) -> None:
+    proc = subprocess.Popen([engine, *args], stdin=subprocess.PIPE, stdout=out_f, stderr=err_f)
 
     def feed():
         try:
@@ -238,12 +317,12 @@ def _run_container(args, name, payload, out_f, err_f, timeout) -> None:
     end = time.monotonic() + timeout
     while proc.poll() is None:
         if time.monotonic() > end:
-            _docker("kill", name)
+            _cli(engine, "kill", name)
             proc.kill()
             proc.wait()
             raise SandboxError(f"sandbox did not finish within {timeout}s and was killed")
         if os.fstat(out_f.fileno()).st_size > MAX_TRACE:
-            _docker("kill", name)
+            _cli(engine, "kill", name)
             proc.kill()
             proc.wait()
             raise SandboxError("trace too large")

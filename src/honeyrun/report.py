@@ -5,7 +5,7 @@ import json
 import os
 import sys
 
-from .analyze import Analysis, clean, verdict
+from .analyze import Analysis, scrub as clean, verdict
 
 __all__ = ["terminal", "agent", "to_json", "to_markdown", "verdict"]
 
@@ -19,6 +19,11 @@ def _use_color(stream) -> bool:
     return bool(os.environ.get("FORCE_COLOR")) or stream.isatty()
 
 
+def note_text(note: str | None) -> str:
+    """The AI reviewer's answer, line by line: control characters stripped and secrets masked."""
+    return "\n".join(clean(line) for line in str(note or "").splitlines() if line.strip())
+
+
 def terminal(a: Analysis, ctx: dict, stream=sys.stdout, show_info: bool = False) -> None:
     color = _use_color(stream)
 
@@ -27,7 +32,8 @@ def terminal(a: Analysis, ctx: dict, stream=sys.stdout, show_info: bool = False)
 
     w = stream.write
     w(f"{c('bold', 'honeyrun')}  {clean(ctx['target'])}\n")
-    w(c("dim", f"sandbox   {ctx['runtime']}, network {ctx['network']}, {ctx['baits']} fake credentials planted\n"))
+    if ctx.get("network") != "not run":
+        w(c("dim", f"sandbox   {ctx['runtime']}, network {ctx['network']}, {ctx['baits']} fake credentials planted\n"))
     if ctx.get("mcp"):
         n = len(a.tools)
         w(c("dim", f"mcp       {n} tool{'s' if n != 1 else ''} listed and called once each\n"))
@@ -37,7 +43,9 @@ def terminal(a: Analysis, ctx: dict, stream=sys.stdout, show_info: bool = False)
         cmd = clean(ph["cmd"])
         cmd = cmd if len(cmd) <= 46 else cmd[:43] + "..."
         w(f"{c('accent', clean(ph['name']).ljust(9))} {cmd:<47} {status:<8} {ph['seconds']:>5.1f}s\n")
-    if not a.phases:
+    if not a.phases and ctx.get("network") == "not run":
+        w(c("dim", "static scan only: nothing was executed\n"))
+    elif not a.phases:
         w(c("dim", "no install or run command detected; pass --install / --run\n"))
     w("\n")
 
@@ -56,9 +64,19 @@ def terminal(a: Analysis, ctx: dict, stream=sys.stdout, show_info: bool = False)
     v = verdict(a.findings)
     counts = {s: sum(1 for f in a.findings if f.severity == s) for s in ("critical", "high", "medium")}
     summary = ", ".join(f"{n} {s}" for s, n in counts.items() if n) or "nothing suspicious observed"
-    w(f"{c(v, v)}  {summary}\n")
-    w(c("dim", f"          {a.processes} processes, {a.files_opened} file opens, {len(a.hosts)} host{'s' if len(a.hosts) != 1 else ''} contacted\n"))
+    word, advice = PLAIN[v]
+    advice = ctx.get("advice", {}).get(v, advice)
+    w(f"{c(v, word)}  {advice}\n")
+    w(c("dim", f"          {summary}\n"))
+    if ctx.get("network") != "not run":
+        w(c("dim", f"          {a.processes} processes, {a.files_opened} file opens, {len(a.hosts)} host{'s' if len(a.hosts) != 1 else ''} contacted\n"))
 
+
+PLAIN = {
+    "FAIL": ("NOT SAFE", "Do not install or run this."),
+    "WARN": ("UNCLEAR", "Read the findings above before you install it."),
+    "PASS": ("LOOKS SAFE", "Nothing suspicious in this run. No sandbox run can prove safety."),
+}
 
 NEXT = {
     "FAIL": "Do not install or run this. Show the findings to the user.",
@@ -72,7 +90,7 @@ def agent(a: Analysis, ctx: dict, note: str | None = None, stream=sys.stdout, li
     v = verdict(a.findings)
     shown = [f for f in a.findings if f.severity != "info"]
     w = stream.write
-    w(f"honeyrun {v} {clean(ctx['target'])} (sandbox: {ctx['runtime']}, network: {ctx['network']})\n")
+    w(f"honeyrun {v} {PLAIN[v][0]}: {clean(ctx['target'])} (sandbox: {ctx['runtime']}, network: {ctx['network']})\n")
     for f in shown[:limit]:
         detail = f" | {clean(f.detail)[:100]}" if f.detail else ""
         w(f"- {f.severity} {f.rule}: {clean(f.title)[:110]}{detail}\n")
@@ -87,12 +105,15 @@ def agent(a: Analysis, ctx: dict, note: str | None = None, stream=sys.stdout, li
 
 
 def to_json(a: Analysis, ctx: dict, note: str | None = None) -> str:
+    phases = [{**p, "cmd": clean(p.get("cmd", "")), "name": clean(p.get("name", ""))} for p in a.phases]
+    hosts = [{**h, "host": clean(h.get("host", ""))} for h in a.hosts]
+    tree = [{**t, "cmd": clean(t.get("cmd", ""))} for t in a.tree]
     return json.dumps({
-        "target": ctx["target"], "runtime": ctx["runtime"], "network": ctx["network"],
+        "target": clean(ctx["target"]), "runtime": ctx["runtime"], "network": ctx["network"],
         "verdict": verdict(a.findings), "findings": [f.to_dict() for f in a.findings],
-        "phases": a.phases, "hosts": a.hosts, "mcp_tools": [t.get("name") for t in a.tools],
+        "phases": phases, "hosts": hosts, "mcp_tools": [clean(t.get("name")) for t in a.tools],
         "stats": {"processes": a.processes, "file_opens": a.files_opened},
-        "process_tree": a.tree, "file_changes": a.files, "ai_review": note,
+        "process_tree": tree, "file_changes": a.files, "ai_review": note_text(note) if note else None,
     }, indent=2, default=list)
 
 
@@ -122,3 +143,63 @@ def to_markdown(a: Analysis, ctx: dict) -> str:
     else:
         lines.append("Nothing suspicious observed.")
     return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------- abuse report
+
+REPORT_TO = (
+    "GitHub: https://github.com/contact/report-abuse (choose: malware or exploits)",
+    "npm: https://www.npmjs.com/support (or 'Report malware' on the package page)",
+    "PyPI: https://pypi.org/security/ (or 'Report project as malware' on the project page)",
+)
+
+
+def abuse(a: Analysis, ctx: dict, version: str) -> str:
+    """A short, factual report a person can paste into a registry's or GitHub's abuse form.
+
+    Built from the findings only: no local paths beyond the sandbox's own, no real secrets
+    (the credentials involved were fake ones planted by honeyrun), no guesses about intent.
+    """
+    serious = [f for f in a.findings if f.severity in ("critical", "high")][:6]
+    if not serious:
+        return ""
+    if ctx["network"] == "not run":
+        how = (f"contains the following, found by reading its files with honeyrun {version} "
+               "(nothing was executed).")
+    else:
+        how = (f"did the following when installed and run in an isolated sandbox (honeyrun {version}, "
+               f"{ctx['runtime']}, network {ctx['network']}). The credentials it touched were fake ones planted for the test.")
+    lines = [f"Subject: Malicious behaviour in {clean(ctx['target'])}", "", f"{clean(ctx['target'])} {how}", ""]
+    for f in serious:
+        lines.append(f"- {clean(f.title)}" + (f" ({clean(f.detail)[:140]})" if f.detail else ""))
+    lines += ["", f"To reproduce: pipx install git+https://github.com/m4xkushnir/honeyrun && honeyrun {clean(ctx['target'])}",
+              "", "Report it to:"] + [f"  {x}" for x in REPORT_TO]
+    return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------- SARIF (GitHub code scanning and friends)
+
+def to_sarif(a: Analysis, ctx: dict, version: str) -> str:
+    level = {"critical": "error", "high": "error", "medium": "warning", "info": "note"}
+    rules = sorted({f.rule for f in a.findings})
+    fallback = ctx.get("manifest") or "README.md"
+    results = []
+    for f in a.findings:
+        uri = clean(getattr(f, "file", "") or fallback)
+        results.append({
+            "ruleId": f.rule, "level": level[f.severity],
+            "message": {"text": clean(f.title) + (f" ({clean(f.detail)[:200]})" if f.detail else "")},
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri}, "region": {"startLine": 1}}}],
+            "properties": {"severity": f.severity, "phase": f.phase},
+        })
+    return json.dumps({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {"driver": {"name": "honeyrun", "version": version,
+                                "informationUri": "https://github.com/m4xkushnir/honeyrun",
+                                "rules": [{"id": r, "shortDescription": {"text": r.replace("-", " ")}} for r in rules]}},
+            "results": results,
+            "properties": {"verdict": verdict(a.findings), "target": clean(ctx["target"]), "sandbox": ctx["runtime"]},
+        }],
+    }, indent=2)

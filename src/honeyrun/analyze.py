@@ -9,9 +9,12 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+from .deobf import payloads
 from .bait import Bait, bait_needles
 
 HOME = "/home/runner"
+PROBE_HOST = "honeyrun.example.net"
+SEARCH_SUFFIXES = (".internal.cloudapp.net", ".internal", ".local", ".lan", ".home.arpa")
 WORK = "/workspace"
 SEVERITIES = ("info", "medium", "high", "critical")
 
@@ -30,6 +33,9 @@ EXPECTED_HOSTS = (
 )
 
 # reads by a package manager of its own config file are normal
+# extension modules and auditwheel's bundled libraries; anything else native in site-packages is odd
+SITE_NATIVE_OK = re.compile(r"(\.so(\.\d+)*$|\.abi3\.so$|-linux-gnu\.so$|/[^/]+\.libs/[^/]+$)")
+
 EXPECTED_READERS = {".npmrc": ("npm", "npx", "yarn", "pnpm")}
 
 # paths that infostealers probe; touching them is the signal even when they don't exist
@@ -71,6 +77,9 @@ SANDBOX_PROBES = re.compile(r"^/\.dockerenv$|^/proc/1/cgroup$|^/proc/1/sched$|^/
                             r"^/proc/scsi/scsi$|^/sys/hypervisor/|^/proc/sys/kernel/yama/")
 MINER = re.compile(r"stratum\+(tcp|ssl)://|\bxmrig\b|--donate-level|cryptonight|randomx|"
                    r"(supportxmr|nanopool|hashvault|minexmr|moneroocean|2miners|f2pool|nicehash|ethermine|herominers)\.", re.I)
+# names malware borrows so `ps` looks normal; real ones live under /usr, /bin or /sbin
+DISGUISE = re.compile(r"^(kworker|kthreadd|ksoftirqd|systemd|systemd-\w+|sshd|dbus-daemon|crond?|rsyslogd|"
+                      r"udevd|init|launchd|mds|WindowServer|svchost(\.exe)?|lsass(\.exe)?|explorer\.exe)\b")
 ESCAPE_SYSCALLS = {"setns": "high", "mount": "high", "init_module": "high", "finit_module": "high",
                    "unshare": "medium", "ptrace": "medium"}
 EXECUTABLE_MAGIC = {"7f454c46": "ELF", "cffaedfe": "Mach-O", "cefaedfe": "Mach-O", "4d5a9000": "PE"}
@@ -99,6 +108,14 @@ def clean(s: object) -> str:
     s = re.sub(r"[\r\n\t\v\f]+", " ", str(s))
     s = HIDDEN_CHARS.sub("", CONTROL.sub("", s))
     return re.sub(r" {2,}", " ", s).strip()
+
+def scrub(s: object) -> str:
+    """clean(), then mask tokens and URL passwords, and never show the real home directory."""
+    from .installed import mask      # lazy: installed imports this module
+    out = mask(clean(s))
+    home = os.path.expanduser("~")
+    return out.replace(home, "~") if home not in ("", "/") else out
+
 
 LINE = re.compile(r"^(\d+)\s+\S+\s+(.*)$")
 CALL = re.compile(r"^(\w+)\((.*)\)\s+=\s+(-?\d+|\?|0x[0-9a-f]+)(?:<[^>]*>)?(?:\s+([A-Z0-9_]+))?")
@@ -174,9 +191,12 @@ class Finding:
     title: str
     detail: str = ""
     phase: str = ""
+    file: str = ""      # repo-relative path, when the finding is about one file
 
     def __post_init__(self):
-        self.title, self.detail, self.phase = clean(self.title), clean(self.detail), clean(self.phase)
+        # Masked at the source so no output (terminal, JSON, SARIF, abuse report) can carry a token.
+        self.title, self.detail = scrub(self.title), scrub(self.detail)
+        self.phase = clean(self.phase)
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
@@ -287,6 +307,11 @@ def parse_strace(raw: str, phase: str) -> list[Event]:
 
 def host_expected(host: str) -> bool:
     host = host.lower().rstrip(".")
+    if host == PROBE_HOST:
+        return True     # the URL honeyrun itself hands to MCP tools as a test argument
+    # Only a resolver search domain may follow it: honeyrun.example.net.evil.com must not hide.
+    if host.startswith(PROBE_HOST + ".") and host.endswith(SEARCH_SUFFIXES):
+        return True
     return any(host == h or host.endswith("." + h) for h in EXPECTED_HOSTS)
 
 
@@ -396,6 +421,13 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                     and "<pip-setuptools-caller>" not in joined) \
                 or (base == "node" and "-e" in argv and re.search(r"eval\(|Buffer\.from\([^)]*base64", joined)):
             add("medium", "obfuscation", base, "decodes and runs an inline payload", joined[:160], ev.phase)
+            for decoded in payloads(joined)[:1]:
+                add("info", "decoded-payload", decoded[:30], "decoded the inline payload", decoded[:300], ev.phase)
+        name0 = argv[0] if argv else ""
+        if ev.data["ok"] and (name0.startswith("[") or (DISGUISE.match(os.path.basename(name0) or base)
+                                                       and not ev.data["path"].startswith(("/usr/", "/bin/", "/sbin/", "/lib")))):
+            add("high", "disguised-process", name0[:40] or base,
+                f"runs a process disguised as a system process: {name0[:40] or base}", f"{ev.data['path']} {joined[:120]}", ev.phase)
         if MINER.search(joined):
             add("high", "crypto-miner", base, "starts a cryptocurrency miner", joined[:160], ev.phase)
         if re.match(r"^(/proc/self/fd/|/proc/\d+/fd/|/dev/shm/|/memfd:|/run/user/)", ev.data["path"]):
@@ -542,7 +574,9 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             if mid == 2 and not listed and isinstance((msg.get("result") or {}).get("tools"), list):
                 # the first list is what a client would have shown; a later clean one must not replace it
                 listed = True
-                tools += [t for t in msg["result"]["tools"] if isinstance(t, dict)]
+                known = {json.dumps(t, sort_keys=True) for t in tools}
+                tools += [t for t in msg["result"]["tools"] if isinstance(t, dict)
+                          and json.dumps(t, sort_keys=True) not in known]   # the later pass lists them again
             elif isinstance(mid, int) and not isinstance(mid, bool) and mid >= 100 and ("result" in msg or "error" in msg):
                 blob = json.dumps({"result": msg.get("result"), "error": msg.get("error")}, ensure_ascii=False)
                 if HIDDEN_CHARS.search(blob) or any(rx.search(unicodedata.normalize("NFKC", blob)) for rx in STRONG_INJECTION):
@@ -572,6 +606,9 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         if (ph.get("mcp") or isinstance(probe, dict)) and isinstance(probe, dict) and probe.get("tools_listed") is None:
             add("medium", "incomplete", f"probe-{name}", "the MCP server never answered tools/list: its tools were not exercised",
                 str(probe.get("error") or ""), name)
+        if name.startswith("later") and ph.get("clock_shifted") is False:
+            add("medium", "incomplete", f"clock-{name}",
+                "the clock could not be moved ahead, so time bombs were not tested", "", name)
         if ph.get("evidence_truncated"):
             add("high", "incomplete", f"truncated-{name}", "evidence truncated: part of the trace was dropped, so activity may be missing",
                 "", name)
@@ -599,6 +636,15 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                 add("high", "persistence", path, f"writes to {persist}: {short}", f"{kind} file")
                 continue
             if kind != "deleted" and head in EXECUTABLE_MAGIC and not path.startswith(WORK):
+                if re.match(rf"{HOME}/\.local/lib/python[\d.]+/site-packages/", path):
+                    if SITE_NATIVE_OK.search(path):
+                        continue    # compiled extensions from wheels land here on every pip install
+                    add("medium", "dropped-binary", path, "native executable inside site-packages",
+                        f"{short} ({size} bytes)")
+                    continue
+                if path.startswith(f"{HOME}/.local/bin/"):
+                    add("info", "native-entry-point", path, f"installs a native executable on PATH: {short}", "")
+                    continue
                 add("high", "dropped-binary", path, f"drops a {EXECUTABLE_MAGIC[head]} executable outside the workspace",
                     f"{short} ({size} bytes)")
                 continue
@@ -629,6 +675,15 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         seen.add(key)
         tree.append({"phase": ev.phase, "pid": ev.pid, "parent": ev.proc.parent,
                      "cmd": re.sub(r"\s+", " ", " ".join(ev.data["argv"]))[:200].replace(HOME, "~")})
+
+    # -------------------------------------------------- time bombs
+    # The "later" phase repeats the last phase with the clock 45 days ahead. Anything that shows up
+    # only there was waiting for a date.
+    # (any phase named later*, including the install-time replay "later-install")
+    for f in [f for f in findings.values() if f.phase and all(x.startswith("later") for x in f.phase.split(",")) and f.severity != "info"
+              and f.rule != "incomplete"]:
+        add("high", "delayed-activation", f.rule + f.title,
+            f"only acts when the clock is 45 days ahead: {f.title}", f.detail, f.phase)
 
     out = sorted(findings.values(), key=lambda f: (-SEVERITIES.index(f.severity), f.rule, f.title))
     return Analysis(out, sorted(hosts.values(), key=lambda h: h["host"]), len(seen_pids), files_opened, tools, phases,

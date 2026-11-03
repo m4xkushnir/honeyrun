@@ -19,7 +19,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime", default="auto")
     ap.add_argument("--out", default=str(ROOT / "out"))
-    ap.add_argument("--only")
+    ap.add_argument("--only", help="comma-separated substrings of fixture names")
+    ap.add_argument("--engine", default="auto")
     ap.add_argument("--real", action="store_true",
                     help="run the well-known repos in bench/real-repos.txt with network on; all should PASS")
     args = ap.parse_args()
@@ -30,10 +31,10 @@ def main() -> int:
         return real(args, out)
     rows, misses = [], 0
     for fx in sorted(FIX.iterdir()):
-        if not fx.is_dir() or (args.only and args.only not in fx.name):
+        if not fx.is_dir() or (args.only and not any(o in fx.name for o in args.only.split(","))):
             continue
         exp = json.loads((fx / "expected.json").read_text())
-        cmd = [sys.executable, "-m", "honeyrun", str(fx), "--runtime", args.runtime,
+        cmd = [sys.executable, "-m", "honeyrun", str(fx), "--runtime", args.runtime, "--engine", args.engine,
                "--json", str(out / f"{fx.name}.json"), "--run-timeout", "20"]
         for key in ("install", "run"):
             if key in exp:

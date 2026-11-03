@@ -12,6 +12,7 @@ rewrite its own evidence. /trace-meta is small and separate: the workload can fi
 but the final tar may be written to stdout.
 """
 import base64
+import glob
 import json
 import os
 import pwd
@@ -499,6 +500,13 @@ def run_phase(phase, env, uid):
     timeout = float(phase.get("timeout", 120))
     is_mcp = bool(phase.get("mcp"))
     out = open(f"{TRACE}/{name}.log", "wb")
+    shifted = False
+    if phase.get("clock"):
+        # Time bombs: the same code again with the clock moved forward (libfaketime).
+        lib = next(iter(sorted(glob.glob("/usr/lib/*/faketime/libfaketime.so.1"))), None)
+        if lib:
+            env = {**env, "LD_PRELOAD": lib, "FAKETIME": phase["clock"], "FAKETIME_DONT_RESET": "1"}
+            shifted = True
     cmd = STRACE + ["-o", f"{TRACE}/{name}.strace", "-u", "runner", "--", "/bin/sh", "-c", phase["cmd"]]
     started = time.time()
     proc = subprocess.Popen(
@@ -543,6 +551,8 @@ def run_phase(phase, env, uid):
         "seconds": round(time.time() - started, 2), "timed_out": timed_out,
         "lingering": lingering, "evidence_truncated": truncated,
     }
+    if phase.get("clock"):
+        res["clock_shifted"] = shifted   # False: libfaketime was missing and the real clock was used
     if probe:
         res["mcp_probe"] = probe.status
     return res
@@ -689,6 +699,8 @@ def main():
     for d in (TRACE, META):
         os.makedirs(d, exist_ok=True)
         os.chmod(d, 0o700)
+    if os.path.isdir(PUB):
+        os.chmod(PUB, 0o755)   # some engines cannot set tmpfs modes themselves
     pw = pwd.getpwnam("runner")
     uid, gid = pw.pw_uid, pw.pw_gid
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 MCP_NODE_DEPS = {"@modelcontextprotocol/sdk", "fastmcp", "mcp-framework"}
 MCP_PY_DEPS = re.compile(r"^\s*['\"]?(mcp|fastmcp)\b", re.I)
+LATER_CLOCK = "+45d"   # far enough for "activate after N days" checks, near enough to look plausible
 LIFECYCLE = ("preinstall", "install", "postinstall", "prepare", "prepublish")
 
 
@@ -111,7 +112,7 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
 
 
 def plan(repo: Path, network: str, install: str | None, run: str | None,
-         install_timeout: int, run_timeout: int, mcp: bool | None = None) -> Plan:
+         install_timeout: int, run_timeout: int, mcp: bool | None = None, later: bool = True) -> Plan:
     p = Plan()
     offline = network == "offline"
     auto_install = auto_run = None
@@ -130,4 +131,13 @@ def plan(repo: Path, network: str, install: str | None, run: str | None,
         p.phases.append({"name": "install", "cmd": install, "timeout": install_timeout})
     if run:
         p.phases.append({"name": "run", "cmd": run, "timeout": run_timeout, "mcp": p.mcp})
+    if later and p.phases:
+        last = p.phases[-1]
+        hooks = bool(p.lifecycle) or (repo / "setup.py").exists() or (install is not None and install != auto_install)
+        if install and run and hooks:
+            # An install-time bomb must be replayed too, not only the run phase.
+            p.phases.append({**p.phases[0], "name": "later-install", "clock": LATER_CLOCK,
+                             "timeout": min(install_timeout, 180)})
+        p.phases.append({**last, "name": "later", "clock": LATER_CLOCK,
+                         "timeout": min(last["timeout"], run_timeout)})
     return p

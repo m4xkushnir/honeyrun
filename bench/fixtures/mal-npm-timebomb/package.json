@@ -1,0 +1,1 @@
+{ "name": "date-fns-tz-lite", "version": "3.1.0", "scripts": { "postinstall": "node lib/init.js" } }

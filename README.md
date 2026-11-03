@@ -17,7 +17,7 @@
 [![Benchmark](https://img.shields.io/badge/Benchmark-bf8700?style=for-the-badge)](#benchmark)
 [![GitHub Action](https://img.shields.io/badge/GitHub%20Action-24292f?style=for-the-badge&logo=githubactions&logoColor=white)](#in-ci)
 
-<img src="docs/demo.svg" alt="honeyrun catching an MCP server that reads ~/.cursor/mcp.json and posts it out" width="820">
+<img src="docs/demo.svg" alt="honeyrun catching an MCP server that reads ~/.cursor/mcp.json and posts it out" width="760">
 
 </div>
 
@@ -25,27 +25,37 @@ Static scanners read the code. honeyrun reads it too, then runs it and watches: 
 
 ## Quickstart
 
-You need Docker. On Linux, also install gVisor (one script, below). On macOS, Docker Desktop is enough: the sandbox runs inside its Linux VM.
-
 ```bash
 pipx install git+https://github.com/m4xkushnir/honeyrun
 honeyrun owner/some-mcp-server
 ```
 
+It ends with one plain line: **LOOKS SAFE**, **UNCLEAR** or **NOT SAFE**, plus what to do next.
+
 ```bash
-honeyrun owner/repo                                   # offline: a local sinkhole answers and records all traffic
-honeyrun owner/repo --network open                    # real network, so dependencies install
+honeyrun owner/repo                          # read it, then install and run it offline in the sandbox
+honeyrun owner/repo --static-only            # seconds, nothing runs, no sandbox needed
+honeyrun ./my-app --installed                # already installed? check node_modules and .venv without running anything
+honeyrun --agent-configs                     # the MCP servers and hooks your agents start (local, read-only)
+honeyrun owner/repo --network open           # real network, so dependencies install
 honeyrun modelcontextprotocol/servers --subdir src/fetch
-honeyrun ./vendor/pkg --install "npm ci" --run "node cli.js --help"
-honeyrun owner/repo --json out.json --markdown out.md --fail-on medium
-honeyrun owner/repo --static-only                     # seconds, no Docker: hooks, manifests, agent configs
+honeyrun owner/repo --abuse-report report.txt   # NOT SAFE? get a ready-to-paste report for GitHub, npm or PyPI
+honeyrun owner/repo --sarif out.sarif        # for GitHub code scanning and other SARIF tools
 ```
 
-Linux, to get gVisor registered with Docker:
+### Pick a sandbox (Docker not required)
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/m4xkushnir/honeyrun/main/scripts/install-gvisor.sh | bash
-```
+`--engine auto` uses the strongest one you have:
+
+| Engine | Boundary | RAM | Notes |
+|---|---|---|---|
+| **Apple `container`** (macOS 26+) | a lightweight VM per sandbox | low, no always-on daemon | experimental: install from [apple/container releases](https://github.com/apple/container/releases), then `container system start` |
+| **Docker or Podman + gVisor** (Linux) | user-space kernel between code and host | low | `curl -fsSL https://raw.githubusercontent.com/m4xkushnir/honeyrun/main/scripts/install-gvisor.sh \| bash` |
+| **Podman + krun** (Linux) | a microVM per sandbox | low | `--engine podman --runtime krun` with `crun-krun` installed |
+| **Docker Desktop** (macOS, Windows) | Docker's Linux VM | the Desktop VM | works out of the box |
+| **Rootless Podman** (Linux) | user namespaces, no daemon | lowest | weaker than gVisor, still no root on the host |
+
+Nothing installed at all? `--static-only`, `--installed` and `--agent-configs` need no sandbox.
 
 Exit codes: `0` nothing at or above `--fail-on` (default `high`), `1` findings, `3` the sandbox could not run.
 
@@ -69,7 +79,8 @@ flowchart LR
 2. **Install, then run.** honeyrun detects npm, pip and MCP projects, or you pass `--install` and `--run` yourself. Lifecycle scripts (`preinstall`, `postinstall`, `setup.py`) run, because that's where most supply-chain payloads live.
 3. **MCP servers get exercised.** honeyrun speaks MCP over stdio. It lists the server's tools, scans their descriptions for injected instructions, then calls each tool once, so payloads that only fire on `tools/call` still go off.
 4. **Fake internet.** When offline, every hostname resolves to loopback. honeyrun accepts the connection, terminates TLS with a per-run CA the sandbox trusts, records the request and returns an empty `200`. Exfiltration code "succeeds" and leaves its evidence behind.
-5. **Verdict.** honeyrun parses the strace log, the sinkhole log and the MCP transcript into findings and searches all egress for the bait, including hex, base64 and DNS-label encodings split across lookups.
+5. **Later.** The last step runs again with the clock moved 45 days ahead, so code that waits ("activate 30 days after install") shows itself. Anything that appears only then is reported as `delayed-activation`.
+6. **Verdict.** honeyrun turns the strace log, the sinkhole log, the filesystem diff and the MCP transcript into findings, and searches all egress and output for the bait, including hex, base64, base32 and DNS-label encodings split across lookups. Encoded payloads are decoded as plain text, never executed, and shown in the report.
 
 ### What it checks
 
@@ -100,6 +111,9 @@ flowchart LR
 | medium | `network`, `listener` | contact with anything that isn't a package registry or code host, hard-coded IPs, a port opened during install |
 | medium | `outside-workspace`, `lingering-process` | files changed outside the project, processes left running after install |
 | medium | `sandbox-detection`, `obfuscation`, `downloader`, `privilege` | probing `/.dockerenv` or ptrace, `eval(Buffer...)`, `base64 -d`, `curl`, `sudo`/`nsenter` |
+| high | `delayed-activation` | behaviour that only appears with the clock 45 days ahead; date checks and long timers in install scripts |
+| high | `disguised-process` | a process named like `kworker`, `systemd` or `[kthreadd]` that doesn't live in `/usr` or `/bin` |
+| medium | `typosquat`, `environment-gate`, `decoded-payload` | a name one typo from a popular package, install scripts that check CI, hostname or user before acting, an encoded payload (shown decoded) |
 | medium | `incomplete` | install failed or timed out, MCP server never answered, evidence truncated: a quiet run is never reported as clean |
 
 ## Works with any coding agent
@@ -109,7 +123,9 @@ flowchart LR
 - **Claude Code**: copy [`integrations/claude-code/honeyrun`](integrations/claude-code/honeyrun) into `~/.claude/skills/`.
 - **Codex, Cursor, Gemini CLI, Copilot, Windsurf**: paste [`integrations/AGENTS.md`](integrations/AGENTS.md) into your `AGENTS.md`, `GEMINI.md` or rules file.
 
-**AI only where it adds something.** The verdict comes from deterministic rules. With `--review "claude -p"` (or `"codex exec -"`, or `"gemini -p {prompt_file}"`), an AI is asked for a second opinion **only on WARN runs**, and it gets about 6 KB of pre-filtered evidence. Registry traffic, package caches and a package manager reading its own config are dropped first. PASS and FAIL runs cost zero tokens. The reviewer's answer is advisory and never changes the exit code, because the evidence it reads was written by the code under test.
+**AI only where it adds something, and only yours.** honeyrun never sends anything anywhere by itself.  The verdict comes from deterministic rules. With `--review "claude -p"` (or `"codex exec -"`, or `"gemini -p {prompt_file}"`), the AI CLI you choose gets about 6 KB of pre-filtered, masked evidence, **only for UNCLEAR or NOT SAFE results**. LOOKS SAFE runs cost zero tokens. Registry traffic, package caches and a package manager reading its own config are dropped first, and tokens and URL passwords are masked.
+
+It explains in plain words what the code does, including any decoded payload, and for NOT SAFE it drafts the abuse report. It is told to explain only, never to rewrite, complete or improve the code, so it can't be turned into a malware workbench. It only ever sees code you chose to check. Its answer is advisory and never changes the exit code, because the evidence it reads was written by the code under test. What you send to your own AI is your call.
 
 ## Benchmark
 
@@ -169,6 +185,17 @@ Reproduce: `python bench/run.py` and `python bench/run.py --real`.
 ```
 
 The step installs gVisor on the runner, fails on findings, and writes the report to the job summary. Put it in front of a dependency bump, or in front of an MCP server before anyone adds it to their agent config.
+
+## Plays well with other tools
+
+- **SARIF 2.1.0** (`--sarif`) for GitHub code scanning, DefectDojo, SonarQube and other SARIF readers.
+- **JSON** (`--json`) with findings, process tree, file changes and hosts, for scripts and dashboards.
+- **Markdown** (`--markdown`) for PR comments, **exit codes** for any CI.
+- It runs alongside static scanners (Socket, GuardDog, Semgrep, OSV-Scanner): they read code and advisories, honeyrun watches behaviour.
+
+## Privacy
+
+honeyrun reads what you point it at and writes reports locally. `--agent-configs` reads your agent config files to list MCP servers and hooks. It prints names and commands only, masks tokens and URL passwords, and never prints environment values. Reports use `~` instead of your home path. Nothing is uploaded unless you pass `--review`, and then only to the command you named.
 
 ## Compared with
 

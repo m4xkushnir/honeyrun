@@ -73,3 +73,18 @@ jobs:
         with:
           name: real-repos
           path: bench/out/
+
+  podman-rootless:
+    # No Docker daemon: the same fixtures through rootless Podman.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: podman --version && podman info --format '{{.Host.Security.Rootless}}'
+      - name: Fixtures under rootless Podman
+        run: python bench/run.py --engine podman --only ssh-exfil,https-env,timebomb,wiper,ok-npm-build,ok-py-package,static
+      - if: always()
+        run: cat bench/out/RESULTS.md >> "$GITHUB_STEP_SUMMARY"
