@@ -101,6 +101,10 @@ def _python(repo: Path, plan: Plan, offline: bool) -> tuple[str | None, str | No
         install = "python3 -m pip install --user ."
         if offline:
             install += " --no-build-isolation --no-deps --no-index"
+        if (repo / "setup.py").exists():
+            # pip can refuse to build (odd metadata, unsupported Python) before setup.py ever runs;
+            # running it directly still executes whatever it does at install time.
+            install += " || python3 setup.py --name"
     elif req.exists() and not offline:
         install = "python3 -m pip install --user -r requirements.txt"
 
