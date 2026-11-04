@@ -142,7 +142,7 @@ The code being checked may try to talk to the AI that reads the results. honeyru
 ## In CI or in the cloud
 
 ```yaml
-- uses: m4xkushnir/honeyrun@v0.1.1   # pin to the full commit SHA of the tag in your workflows
+- uses: m4xkushnir/honeyrun@d4b3d7939b20c6b10fe04b0396e7ad58a570f5f8 # v0.1.1
   with:
     target: .              # or owner/repo, npm:name, pypi:name
     network: open          # offline | open
@@ -159,7 +159,7 @@ honeyrun asks you to distrust code you haven't checked, so it shouldn't ask for 
 
 - **Releases are signed and attested.** Each release's wheel and sdist are built in GitHub Actions, published to PyPI with [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (no stored tokens) and carry a Sigstore build-provenance attestation. PyPI shows it on the file page (PEP 740), and `gh attestation verify honeyrun-0.1.1-py3-none-any.whl --repo m4xkushnir/honeyrun` checks a downloaded file.
 - **Tags and commits are signed.** Run `git tag -v v0.1.1` after cloning.
-- **Pin the Action to a commit SHA**, not a branch: `uses: m4xkushnir/honeyrun@<full sha> # v0.1.1`. honeyrun's own workflows pin every action the same way.
+- **Pin the Action to a commit SHA**, not a branch: `uses: m4xkushnir/honeyrun@d4b3d7939b20c6b10fe04b0396e7ad58a570f5f8 # v0.1.1`. honeyrun's own workflows pin every action the same way.
 - **Zero runtime dependencies.** Nothing else gets pulled in when you install it.
 
 ## Benchmark
