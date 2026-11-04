@@ -28,6 +28,16 @@ class Bait:
     env: str | None = None
     content: str = ""
     extra: tuple[str, ...] = ()   # other values from the same file that also prove it was read
+    kind: str = "secret"          # "identity": not a secret, but this machine's name; leaking it is recon
+
+
+def hostname() -> str:
+    """A believable, unique hostname for this run, so seeing it in traffic proves where it came from."""
+    return f"{secrets.choice(['dev', 'build', 'ws', 'laptop'])}-{_tok(14, string.ascii_lowercase + string.digits)}"
+
+
+def identity(host: str) -> Bait:
+    return Bait("this machine's hostname", host, None, kind="identity")
 
 
 def generate() -> list[Bait]:

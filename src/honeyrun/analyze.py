@@ -44,6 +44,7 @@ EXPECTED_READERS = {".npmrc": ("npm", "npx", "yarn", "pnpm")}
 # paths that infostealers probe; touching them is the signal even when they don't exist
 PROBE_PATTERNS = [
     (re.compile(p), label) for p, label in (
+        (r"^/var/lib/cloud/|^/etc/cloud/|^/run/cloud-init/", "cloud-init user data"),
         (r"/\.config/(google-chrome|chromium|BraveSoftware|microsoft-edge)/", "browser profile"),
         (r"/\.mozilla/firefox/", "browser profile"),
         (r"Login Data|/Cookies$|/Local State$", "browser credential store"),
@@ -132,7 +133,15 @@ EXFIL_SERVICE = re.compile(
     r"(^|\.)(pastebin\.com|paste\.ee|hastebin\.com|hastebin\.skyra\.pw|ghostbin\.\w+|transfer\.sh|file\.io|0x0\.st|"
     r"discord\.com|discordapp\.com|api\.telegram\.org|hooks\.slack\.com|webhook\.site|requestbin\.(com|net)|"
     r"requestcatcher\.com|pipedream\.net|ngrok\.io|ngrok-free\.app|ngrok\.app|ngrok\.dev|trycloudflare\.com|"
-    r"serveo\.net|loca\.lt|interact\.sh|burpcollaborator\.net|oast\.(pro|live|site|online|fun|me)|onion(\.\w+)?)(\.|$)")
+    r"serveo\.net|loca\.lt|interact\.sh|interactsh\.com|burpcollaborator\.net|oastify\.com|"
+    r"oast\.(pro|live|site|online|fun|me)|dnslog\.(cn|link|pw)|ceye\.io|eyes\.sh|beeceptor\.com|"
+    r"canarytokens\.(com|org)|hookbin\.com|bxss\.me|xss\.ht|requestinspector\.com|onion(\.\w+)?)(\.|$)")
+# "what is my IP" services: payloads use them to fingerprint the victim before reporting home
+IP_LOOKUP = re.compile(r"(^|\.)(ipinfo\.io|api\.ipify\.org|ipify\.org|ifconfig\.me|icanhazip\.com|checkip\.amazonaws\.com|"
+                       r"ipapi\.co|ip-api\.com|ipecho\.net|myexternalip\.com|wtfismyip\.com|ident\.me)(\.|$)")
+# commands that describe the machine; harmless alone, a fingerprint when followed by a report home
+RECON = re.compile(r"^(whoami|hostname|uname|id|ifconfig|ip|arp|netstat|ss|ps|env|printenv|groups|w|who|last|lsb_release|"
+                   r"hostnamectl|getent|nproc|lscpu|df|mount)$")
 AGENT_SOCKS = ("/run/honeyrun/ssh-agent", "/run/honeyrun/S.gpg-agent")
 FORK_BOMB = 300
 PROC_ENVIRON = re.compile(r"^/proc/(self|thread-self|\d+)/environ$")
@@ -768,7 +777,12 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
         low = hay.lower()
         for needle, b in needle_map.items():
             if needle in hay or (needle.islower() and needle in low):
-                if where.startswith("its own output"):
+                if b.kind == "identity":
+                    # printing your own hostname is normal; sending it somewhere is a fingerprint
+                    if not where.startswith("its own output") and not _own_service(b.label, where):
+                        add("high", "identity-exfil", "hostname", "sends this machine's hostname out (victim fingerprinting)",
+                            where, phase)
+                elif where.startswith("its own output"):
                     add("high", "secret-in-output", b.label, f"prints {b.label} to its output",
                         f"{where}: anything that logs this run (CI) now holds the secret", phase)
                 elif _own_service(b.label, where):
@@ -776,6 +790,26 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
                         f"{b.label} was sent to its own service (normal for an install)", where, phase)
                 else:
                     add("critical", "canary-exfil", b.label, f"{b.label} left the sandbox", where, phase)
+
+    # fingerprinting: describe the machine, then report to somewhere unexpected
+    recon_by_phase: dict[str, set[str]] = {}
+    for ev in (e for e in events if e.kind == "exec" and e.data["ok"]):
+        b = posixpath.basename(ev.data["path"])
+        if RECON.match(b) or (b in ("cat", "head", "less") and any(a in ("/etc/passwd", "/etc/hostname", "/etc/os-release")
+                                                                  for a in ev.data["argv"][1:])):
+            recon_by_phase.setdefault(ev.phase, set()).add(b)
+    for name, h in hosts.items():
+        if IP_LOOKUP.search(name.split(":")[0]):
+            add("medium", "recon", name, f"looks up this machine's public IP ({name})", "", ",".join(sorted(h["phases"])))
+        if host_expected(name):
+            continue
+        for ph in h["phases"]:
+            # a lookup we couldn't place in a phase still counts against recon seen anywhere
+            seen = recon_by_phase.get(ph) or (set().union(*recon_by_phase.values()) if ph == "?" else None)
+            if seen:
+                cmds = ", ".join(sorted(seen))
+                add("high", "recon-beacon", f"{ph}:{name}",
+                    f"fingerprints this machine ({cmds}) and contacts {name}", "typical of dependency-confusion payloads", ph)
 
     # phases with unknown hosts
     phase_order = {p["name"]: i for i, p in enumerate(phases)}

@@ -197,10 +197,12 @@ def main(argv: list[str] | None = None) -> int:
         if use_intel:
             pre += _guard("intel", _intel, label, pkg or _manifest_identity(src, plan.ecosystem))
         baits = bait.generate()
+        host = bait.hostname()
+        baits.append(bait.identity(host))   # a unique hostname: seeing it in traffic means fingerprinting
         if not args.static_only and not args.installed:
             runtime = pick_runtime(args.runtime, args.allow_runc, args.engine)
             runtime_label = runtime.label
-            job = {"network": args.network, "phases": plan.phases,
+            job = {"network": args.network, "phases": plan.phases, "hostname": host,
                    "files": bait.files(baits), "env": bait.env(baits)}
             image = ensure_image(quiet=args.agent, engine=runtime.engine)
             budget = sum(p["timeout"] for p in plan.phases) + 120
@@ -237,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = next((m for m in ("package.json", "pyproject.toml", "setup.py") if (Path(src) / m).is_file()), "") \
         if not cleanup else ""
     ctx = {"target": label, "runtime": runtime_label, "network": args.network if trace else "not run",
-           "baits": len(baits) if trace else 0, "mcp": plan.mcp and bool(trace), "manifest": manifest,
+           "baits": sum(1 for b in baits if b.kind == "secret") if trace else 0, "mcp": plan.mcp and bool(trace), "manifest": manifest,
            "local": bool(args.installed)}
     return _finish(args, result, ctx)
 

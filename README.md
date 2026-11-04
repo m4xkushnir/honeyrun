@@ -26,7 +26,7 @@ Your coding agent installs packages, clones repos and adds MCP servers for you n
 honeyrun runs it for you first, in a throwaway sandbox whose home folder is full of fake keys: SSH, AWS, GitHub, npm, and the configs of Claude, Codex, Cursor and Gemini. Each key is made up for that run. If one turns up in a web request, a DNS lookup or a log line, you know exactly what took it and where it went.
 
 ```bash
-pipx install git+https://github.com/m4xkushnir/honeyrun
+pipx install honeyrun==0.1.1      # signed build on PyPI; see "Verify what you install"
 honeyrun npm:some-package        # or owner/repo, pypi:name, a folder, an MCP server
 ```
 
@@ -72,12 +72,20 @@ When the problem is on your own machine (`--installed`, `--agent-configs`), the 
 | Engine | Boundary | Notes |
 |---|---|---|
 | Apple `container` (macOS 26+) | a small VM per sandbox | no always-on daemon, light on RAM. Experimental, from [apple/container](https://github.com/apple/container/releases) |
-| Docker or Podman + gVisor (Linux) | a user-space kernel between the code and yours | `curl -fsSL https://raw.githubusercontent.com/m4xkushnir/honeyrun/main/scripts/install-gvisor.sh \| bash` |
+| Docker or Podman + gVisor (Linux) | a user-space kernel between the code and yours | [`scripts/install-gvisor.sh`](scripts/install-gvisor.sh), see below |
 | Podman + krun (Linux) | a microVM per sandbox | `--engine podman --runtime krun` with `crun-krun` |
 | Docker Desktop (macOS, Windows) | Docker's Linux VM | works out of the box |
 | Rootless Podman (Linux) | user namespaces, no daemon | lightest; weaker than gVisor, still no root on your machine |
 
 No engine at all? `--static-only`, `--installed` and `--agent-configs` don't need one.
+
+To install gVisor, take the script from a release tag, check it, then run it. It only trusts gVisor's apt key if its fingerprint matches `6F1DF85E3A71C24918E727D56FC6D554E32BD943`, the key published in the [gVisor source](https://github.com/google/gvisor/blob/master/website/archive.key):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/m4xkushnir/honeyrun/v0.1.1/scripts/install-gvisor.sh
+echo "499613d33d17c1516a171f60559f0faecef935a6a87b24660b72504d640dad89  install-gvisor.sh" | sha256sum -c -
+bash install-gvisor.sh
+```
 
 ## What it looks for
 
@@ -134,7 +142,7 @@ The code being checked may try to talk to the AI that reads the results. honeyru
 ## In CI or in the cloud
 
 ```yaml
-- uses: m4xkushnir/honeyrun@main
+- uses: m4xkushnir/honeyrun@v0.1.1   # pin to the full commit SHA of the tag in your workflows
   with:
     target: .              # or owner/repo, npm:name, pypi:name
     network: open          # offline | open
@@ -144,6 +152,15 @@ The code being checked may try to talk to the AI that reads the results. honeyru
 The step installs gVisor on the runner, fails on findings and writes the report to the job summary. It's also the easiest way to keep untrusted code off your laptop entirely: it runs on GitHub's machines. To use a server of your own, point Docker at it: `DOCKER_HOST=ssh://you@server honeyrun owner/repo`.
 
 Other tools can read the results too: `--sarif` for GitHub code scanning and other SARIF readers, `--json` for scripts, `--markdown` for PR comments, and exit codes `0` clean, `1` findings, `3` couldn't run. It sits well next to static scanners such as Socket, GuardDog, Semgrep or OSV-Scanner. They read code and advisories; honeyrun watches behaviour.
+
+## Verify what you install
+
+honeyrun asks you to distrust code you haven't checked, so it shouldn't ask for blind trust either:
+
+- **Releases are signed and attested.** Each release's wheel and sdist are built in GitHub Actions, published to PyPI with [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (no stored tokens) and carry a Sigstore build-provenance attestation. PyPI shows it on the file page (PEP 740), and `gh attestation verify honeyrun-0.1.1-py3-none-any.whl --repo m4xkushnir/honeyrun` checks a downloaded file.
+- **Tags and commits are signed.** Run `git tag -v v0.1.1` after cloning.
+- **Pin the Action to a commit SHA**, not a branch: `uses: m4xkushnir/honeyrun@<full sha> # v0.1.1`. honeyrun's own workflows pin every action the same way.
+- **Zero runtime dependencies.** Nothing else gets pulled in when you install it.
 
 ## Benchmark
 

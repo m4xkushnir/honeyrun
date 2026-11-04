@@ -817,6 +817,7 @@ def main():
         "PATH": f"{HOME}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": HOME, "USER": "runner", "LOGNAME": "runner", "SHELL": "/bin/bash",
         "LANG": "C.UTF-8", "TERM": "xterm-256color",
+        "NODE_PATH": "/usr/local/lib/node_modules",
         "NPM_CONFIG_UPDATE_NOTIFIER": "false", "NPM_CONFIG_FUND": "false", "NPM_CONFIG_AUDIT": "false",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_BREAK_SYSTEM_PACKAGES": "1",
     }

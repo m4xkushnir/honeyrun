@@ -236,7 +236,7 @@ def run_job(src: Path, job: dict, runtime: Runtime, image: str, timeout: int,
     args = [
         "run", "--rm", "-i", "--name", name,
         *(["--runtime", runtime.name] if runtime.name else []),
-        "--hostname", "devbox",
+        "--hostname", str(job.get("hostname") or "devbox"),
         "--read-only",
         "--cap-drop", "ALL",
         # Root agent only: plant bait, drop to `runner`, trace it, kill it, bind :53/:80/:443,
