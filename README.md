@@ -33,7 +33,7 @@ honeyrun npm:some-package        # or owner/repo, pypi:name, a folder, an MCP se
 Before running anything it reads the code for hooks and hidden instructions. While it runs, it watches every process, file and connection. Then it runs the code again with the clock 45 days ahead, for code that waits. You get one line at the end: **LOOKS SAFE**, **UNCLEAR** or **NOT SAFE**, and what to do next.
 
 - **One command, no account, no server.** Runs on your laptop or in a GitHub Action. Zero Python dependencies.
-- **Catches what scanners can't read.** Encrypted, obfuscated and delayed payloads show themselves when they run.
+- **Catches what reading misses.** On 100 real malicious packages, 33 were marked NOT SAFE, and 32 of those looked clean or only suspicious when the same code was just read. They gave themselves away when they ran.
 - **Built for the agent era.** It calls every MCP tool, spots instructions hidden for your AI, notices when a tool quietly changes after you approved it, and gives your agent a short answer it can act on.
 
 ## Try it
@@ -164,9 +164,32 @@ honeyrun asks you to distrust code you haven't checked, so it shouldn't ask for 
 
 ## Benchmark
 
-Every number here comes from CI, under gVisor on `ubuntu-latest`, on every push.
+### Real malware
 
-**Detection on [32 fixtures](bench/fixtures).** 25 imitate real malware: install hooks that steal SSH and AWS keys, `curl | sh`, tokens tunnelled out over DNS or HTTPS, an MCP server that poisons its tool description and steals other agents' configs, a time bomb that waits 30 days, a CI-only payload, cloud metadata theft, SSH agent hijack, a fake `git` in PATH, droppers, wipers, miners, disguised processes, webhook exfiltration and hooks hidden in editor and agent configs. 7 are ordinary projects that build, read their own config, serve MCP and ship images, archives and analytics.
+100 real malicious packages (50 npm, 50 PyPI), picked at random with a fixed seed from [Datadog's public dataset](https://github.com/DataDog/malicious-software-packages-dataset) of malware found in the wild. Each one ran in CI under gVisor, fully offline, with OSV lookups turned off so honeyrun couldn't simply recognise the names. [Workflow](.github/workflows/real-malware.yml) · [script](bench/real_malware.py).
+
+| | npm | PyPI | Total |
+|---|---:|---:|---:|
+| **NOT SAFE** | 20 | 13 | **33** |
+| UNCLEAR | 15 | 20 | 35 |
+| LOOKS SAFE (missed) | 15 | 17 | 32 |
+| NOT SAFE from reading the code alone | 1 | 0 | 1 |
+
+One of them, `sap-cd` (npm), reads as harmless. When installed, it runs `whoami`, `hostname` and `env` and sends the AWS, GitHub, OpenAI and Anthropic keys from the environment to an out-of-band collaborator server. honeyrun sees the four planted keys leave and names the server.
+
+Why the misses are missed, from the logs of the run:
+
+- **Windows-only payloads.** Some samples call `ctypes.windll` or other Windows APIs. The sandbox is Linux, so they crash before doing anything.
+- **Broken packages.** Missing files (`Cannot find module './postinstall.js'`), corrupted tarballs, tools like `bun` that aren't installed, Python version pins.
+- **Payloads that wait for something specific:** a function call, a particular argument, a missing credential (`Missing Airtable credentials`), or a live server that answers with a second stage.
+
+"UNCLEAR" usually means honeyrun saw an unexpected host, obfuscated code or an install that couldn't finish, without hard proof of theft. That's a reason to look before installing, not a pass. This benchmark also drove fixes: the first run caught 14 of the 100; adding common build tools and libraries to the sandbox, out-of-band hosts and machine-fingerprinting detection brought it to 33.
+
+### Fixtures and real projects
+
+Every number below comes from CI, under gVisor on `ubuntu-latest`, on every push.
+
+**Detection on [32 fixtures](bench/fixtures)** written to cover techniques one by one. 25 imitate real malware: install hooks that steal SSH and AWS keys, `curl | sh`, tokens tunnelled out over DNS or HTTPS, an MCP server that poisons its tool description and steals other agents' configs, a time bomb that waits 30 days, a CI-only payload, cloud metadata theft, SSH agent hijack, a fake `git` in PATH, droppers, wipers, miners, disguised processes, webhook exfiltration and hooks hidden in editor and agent configs. 7 are ordinary projects that build, read their own config, serve MCP and ship images, archives and analytics.
 
 | Malicious flagged | Benign flagged | Exact rule match | Median time per check |
 |:---:|:---:|:---:|:---:|
@@ -188,7 +211,7 @@ Every number here comes from CI, under gVisor on `ubuntu-latest`, on every push.
 
 **0 of 9 flagged**, and every install succeeded. CI fails if one doesn't, so a clean result can't hide a broken run. The same fixtures also run under rootless Podman, with no Docker at all, and the unit tests run on Linux, macOS and Windows.
 
-Reproduce: `python bench/run.py` and `python bench/run.py --real`.
+Reproduce: `python bench/run.py`, `python bench/run.py --real`, and the [real-malware workflow](.github/workflows/real-malware.yml) (it refuses to run outside a disposable CI runner).
 
 ## Compared with
 

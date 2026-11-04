@@ -76,6 +76,21 @@ class Recon(unittest.TestCase):
         self.assertIn(("medium", "recon"), {(f.severity, f.rule) for f in a.findings})
 
 
+class ReconAcrossPhases(unittest.TestCase):
+    def test_recon_in_run_and_later_is_not_a_time_bomb(self):
+        baits = bait.generate()
+        s = f'1 t execve("{hx("/usr/bin/whoami")}", ["{hx("whoami")}"], 0x0 /* 1 vars */) = 0\n'
+        meta = {"phases": [{"name": n, "cmd": "x", "exit": 0, "seconds": 1, "timed_out": False, "lingering": [],
+                            "t0": i * 10, "t1": i * 10 + 9} for i, n in enumerate(("run", "later"))]}
+        net = [{"kind": "dns", "qname": "c2.example.net", "qtype": 1, "t": 5},
+               {"kind": "dns", "qname": "c2.example.net", "qtype": 1, "t": 15}]
+        trace = {"meta.json": json.dumps(meta).encode(), "run.strace": s.encode(), "later.strace": s.encode(),
+                 "net.jsonl": "\n".join(json.dumps(r) for r in net).encode()}
+        rules = [f.rule for f in analyze(trace, baits, "offline").findings]
+        self.assertEqual(rules.count("recon-beacon"), 1)
+        self.assertNotIn("delayed-activation", rules)
+
+
 class MoreExfilHosts(unittest.TestCase):
     def test_oast_and_dnslog_hosts(self):
         for host in ("x1y2.oastify.com", "abc.dnslog.cn", "q.ceye.io", "t.canarytokens.com"):

@@ -803,13 +803,17 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
             add("medium", "recon", name, f"looks up this machine's public IP ({name})", "", ",".join(sorted(h["phases"])))
         if host_expected(name):
             continue
+        # one finding per host across all phases: per-phase findings would make the replay passes
+        # look like new behaviour and trip delayed-activation
+        hit_phases, cmds = [], set()
         for ph in h["phases"]:
-            # a lookup we couldn't place in a phase still counts against recon seen anywhere
             seen = recon_by_phase.get(ph) or (set().union(*recon_by_phase.values()) if ph == "?" else None)
             if seen:
-                cmds = ", ".join(sorted(seen))
-                add("high", "recon-beacon", f"{ph}:{name}",
-                    f"fingerprints this machine ({cmds}) and contacts {name}", "typical of dependency-confusion payloads", ph)
+                hit_phases.append(ph)
+                cmds |= seen
+        if hit_phases:
+            add("high", "recon-beacon", name, f"fingerprints this machine ({', '.join(sorted(cmds))}) and contacts {name}",
+                "typical of dependency-confusion payloads", ",".join(sorted(hit_phases)))
 
     # phases with unknown hosts
     phase_order = {p["name"]: i for i, p in enumerate(phases)}
