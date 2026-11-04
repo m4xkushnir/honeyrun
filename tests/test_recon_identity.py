@@ -76,6 +76,21 @@ class Recon(unittest.TestCase):
         self.assertIn(("medium", "recon"), {(f.severity, f.rule) for f in a.findings})
 
 
+class ReconWithPackageManagers(unittest.TestCase):
+    def test_pip_uname_then_cdn_ip_after_dns_is_quiet(self):
+        # pip runs uname, resolves pypi.org, then connects to the CDN address: normal
+        s = (f'1 t execve("{hx("/usr/bin/uname")}", ["{hx("uname")}", "{hx("-rs")}"], 0x0 /* 1 vars */) = 0\n'
+             f'1 t connect(3, {{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("{hx("151.101.0.223")}")}}, 16) = 0\n')
+        baits = bait.generate()
+        meta = {"phases": [{"name": "install", "cmd": "x", "exit": 0, "seconds": 1, "timed_out": False, "lingering": []}]}
+        q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04pypi\x03org\x00\x00\x01\x00\x01"
+        qhex = "".join("\\x%02x" % c for c in q)   # no backslashes inside f-string expressions (Python 3.11)
+        dns_line = '1 t sendto(4<UDP:[1->2:53]>, "%s", %d, 0, NULL, 0) = %d\n' % (qhex, len(q), len(q))
+        trace = {"meta.json": json.dumps(meta).encode(), "install.strace": (dns_line + s).encode()}
+        rules = {f.rule for f in analyze(trace, baits, "open").findings}
+        self.assertNotIn("recon-beacon", rules)
+
+
 class ReconAcrossPhases(unittest.TestCase):
     def test_recon_in_run_and_later_is_not_a_time_bomb(self):
         baits = bait.generate()

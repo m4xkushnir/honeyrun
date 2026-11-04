@@ -801,8 +801,8 @@ def analyze(trace: dict[str, bytes], baits: list[Bait], network: str) -> Analysi
     for name, h in hosts.items():
         if IP_LOOKUP.search(name.split(":")[0]):
             add("medium", "recon", name, f"looks up this machine's public IP ({name})", "", ",".join(sorted(h["phases"])))
-        if host_expected(name):
-            continue
+        if host_expected(name) or set(h["how"]) == {"ip-after-dns"}:
+            continue    # an IP reached after a DNS lookup is that name's address, judged by the name
         # one finding per host across all phases: per-phase findings would make the replay passes
         # look like new behaviour and trip delayed-activation
         hit_phases, cmds = [], set()
