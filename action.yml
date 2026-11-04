@@ -1,4 +1,4 @@
-name: honeyrun
+name: honeyrun sandbox
 description: Install and run an untrusted repo in a gVisor sandbox full of fake credentials, and fail on what it reaches for.
 author: m4xkushnir
 branding:
