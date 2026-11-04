@@ -26,7 +26,7 @@ Your coding agent installs packages, clones repos and adds MCP servers for you n
 honeyrun runs it for you first, in a throwaway sandbox whose home folder is full of fake keys: SSH, AWS, GitHub, npm, and the configs of Claude, Codex, Cursor and Gemini. Each key is made up for that run. If one turns up in a web request, a DNS lookup or a log line, you know exactly what took it and where it went.
 
 ```bash
-pipx install honeyrun==0.1.1      # signed build on PyPI; see "Verify what you install"
+pipx install honeyrun==0.1.2      # signed build on PyPI; see "Verify what you install"
 honeyrun npm:some-package        # or owner/repo, pypi:name, a folder, an MCP server
 ```
 
@@ -82,7 +82,7 @@ No engine at all? `--static-only`, `--installed` and `--agent-configs` don't nee
 To install gVisor, take the script from a release tag, check it, then run it. It only trusts gVisor's apt key if its fingerprint matches `6F1DF85E3A71C24918E727D56FC6D554E32BD943`, the key published in the [gVisor source](https://github.com/google/gvisor/blob/master/website/archive.key):
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/m4xkushnir/honeyrun/v0.1.1/scripts/install-gvisor.sh
+curl -fsSLO https://raw.githubusercontent.com/m4xkushnir/honeyrun/v0.1.2/scripts/install-gvisor.sh
 echo "499613d33d17c1516a171f60559f0faecef935a6a87b24660b72504d640dad89  install-gvisor.sh" | sha256sum -c -
 bash install-gvisor.sh
 ```
@@ -142,7 +142,7 @@ The code being checked may try to talk to the AI that reads the results. honeyru
 ## In CI or in the cloud
 
 ```yaml
-- uses: m4xkushnir/honeyrun@d4b3d7939b20c6b10fe04b0396e7ad58a570f5f8 # v0.1.1
+- uses: m4xkushnir/honeyrun@44560d9d8481c14e1f51dd225ef2d32ca037b56b # v0.1.2
   with:
     target: .              # or owner/repo, npm:name, pypi:name
     network: open          # offline | open
@@ -157,9 +157,9 @@ Other tools can read the results too: `--sarif` for GitHub code scanning and oth
 
 honeyrun asks you to distrust code you haven't checked, so it shouldn't ask for blind trust either:
 
-- **Releases are signed and attested.** Each release's wheel and sdist are built in GitHub Actions, published to PyPI with [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (no stored tokens) and carry a Sigstore build-provenance attestation. PyPI shows it on the file page (PEP 740), and `gh attestation verify honeyrun-0.1.1-py3-none-any.whl --repo m4xkushnir/honeyrun` checks a downloaded file.
-- **Tags and commits are signed.** Run `git tag -v v0.1.1` after cloning.
-- **Pin the Action to a commit SHA**, not a branch: `uses: m4xkushnir/honeyrun@d4b3d7939b20c6b10fe04b0396e7ad58a570f5f8 # v0.1.1`. honeyrun's own workflows pin every action the same way.
+- **Releases are signed and attested.** Each release's wheel and sdist are built in GitHub Actions, published to PyPI with [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (no stored tokens) and carry a Sigstore build-provenance attestation. PyPI shows it on the file page (PEP 740), and `gh attestation verify honeyrun-0.1.2-py3-none-any.whl --repo m4xkushnir/honeyrun` checks a downloaded file.
+- **Tags and commits are signed.** Run `git tag -v v0.1.2` after cloning.
+- **Pin the Action to a commit SHA**, not a branch: `uses: m4xkushnir/honeyrun@44560d9d8481c14e1f51dd225ef2d32ca037b56b # v0.1.2`. honeyrun's own workflows pin every action the same way.
 - **Zero runtime dependencies.** Nothing else gets pulled in when you install it.
 
 ## Benchmark
